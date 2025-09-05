@@ -108,7 +108,6 @@ QDRANT_TIMEOUT=120
 
    ```bash
    python chunking.py --input "luat_hon_nhan_va_gia_dinh.docx" --output "hn2014_chunks.json" --law-no "52/2014/QH13" --law-title "Luật Hôn nhân và Gia đình" --law-id "HN2014"
-"""
    ```
 
 2. Import dữ liệu vào Qdrant:
