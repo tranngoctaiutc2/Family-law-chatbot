@@ -359,6 +359,12 @@ def respond(message, history_msgs, k, temperature, cur_page_size, session_id):
     mem = get_memory(session_id)
     mem.add_user_message(message)
 
+    # 🔹 Cập nhật hiển thị history memory
+    mem_history = get_history_messages(session_id)
+    memory_display = "\n".join(
+        [f"- {m['role'].capitalize()}: {m['content']}" for m in mem_history]
+    ) or "(Chưa có lịch sử memory)"
+
     # 5) Stream assistant
     acc = ""
     for chunk in stream_answer(prompt, temperature=float(temperature)):
@@ -378,7 +384,8 @@ def respond(message, history_msgs, k, temperature, cur_page_size, session_id):
             docs,
             first_page,
             page_label,
-            session_id  # Persist session_id
+            session_id,  # Persist session_id
+            memory_display 
         )
 
     # 🔹 Sau khi stream xong → lưu vào memory
@@ -412,7 +419,7 @@ with gr.Blocks(
                 type="messages",
                 show_copy_button=True,
                 elem_id="chatbot",
-                bubble_full_width=False,  # Tin nhắn không chiếm toàn chiều rộng
+                bubble_full_width=False,
             )
             gr.Markdown(
                 "> 💡 Mẹo: Mô tả tình huống (mốc thời gian, tài sản, con chung, thỏa thuận...) để phân tích chính xác hơn.",
@@ -444,6 +451,14 @@ with gr.Blocks(
         send = gr.Button("Gửi", variant="primary", scale=1)
         clear_btn = gr.Button("Xoá", variant="secondary", scale=1)
 
+    # ------------------ Memory history display ------------------
+    with gr.Accordion("📜 Lịch sử memory (click để xem)", open=False):
+        memory_md = gr.Markdown(
+            value="(Chưa có lịch sử)",
+            elem_id="memory_history",
+            container=True,
+    )
+
     # States
     state_session = gr.State(None)  # Sửa: None để sinh UUID per session
     state_last_answer = gr.State("")
@@ -455,15 +470,16 @@ with gr.Blocks(
     send.click(
         respond,
         inputs=[msg, chatbot, topk, temp, page_size, state_session],
-        outputs=[msg, chatbot, cites_md, state_last_answer, state_last_cites, state_docs, state_page, page_info, state_session],  # Thêm state_session
+        outputs=[msg, chatbot, cites_md, state_last_answer, state_last_cites, state_docs, state_page, page_info, state_session, memory_md],
         queue=True,
     )
     msg.submit(
         respond,
         inputs=[msg, chatbot, topk, temp, page_size, state_session],
-        outputs=[msg, chatbot, cites_md, state_last_answer, state_last_cites, state_docs, state_page, page_info, state_session],  # Thêm state_session
+        outputs=[msg, chatbot, cites_md, state_last_answer, state_last_cites, state_docs, state_page, page_info, state_session, memory_md],
         queue=True,
     )
+
 
     clear_btn.click(
         on_clear,

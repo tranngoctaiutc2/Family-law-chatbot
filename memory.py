@@ -11,7 +11,7 @@ from pydantic import Field
 # Load biến môi trường
 # ----------------------------
 load_dotenv()
-MONGO_URI = os.getenv("MONGO_URI").strip();
+MONGO_URI = os.getenv("MONGO_URI").strip()
 if not MONGO_URI:
     raise ValueError("❌ Chưa cấu hình MONGO_URI trong file .env")
 
@@ -37,7 +37,7 @@ print("Collections in DB:", db.list_collection_names())
 # Hàm khởi tạo message history
 # ----------------------------
 class AutoSaveMemory(ConversationBufferMemory):
-    session_id: str = Field(..., description="Session ID for the memory")  # Define as Pydantic Field
+    session_id: str = Field(..., description="Session ID for the memory")
 
     def add_message(self, message):
         print(f"[DEBUG] Adding message to memory: {message}")
@@ -60,7 +60,7 @@ class AutoSaveMemory(ConversationBufferMemory):
 def get_memory(session_id: str):
     print(f"[DEBUG] Loading memory for session_id: {session_id}")
     memory = AutoSaveMemory(
-        session_id=session_id,  # Pass session_id as a keyword argument
+        session_id=session_id,
         memory_key="chat_history",
         return_messages=True
     )
@@ -77,18 +77,24 @@ def get_memory(session_id: str):
     return memory
 
 # ----------------------------
-# Hàm lưu memory vào MongoDB
+# Hàm lưu memory vào MongoDB (cập nhật với title)
 # ----------------------------
 def save_memory(session_id: str, memory: ConversationBufferMemory):
     messages = [
         {"type": "user" if isinstance(m, HumanMessage) else "ai", "content": m.content}
         for m in memory.chat_memory.messages
     ]
+    # Lấy title từ tin nhắn user đầu tiên nếu chưa có
+    title = messages[0]["content"] if messages else "No Title"
     print(f"[DEBUG] Saving messages for session_id {session_id}: {messages}")
     try:
         result = collection.update_one(
             {"session_id": session_id},
-            {"$set": {"messages": messages, "updated_at": datetime.utcnow()}},
+            {"$set": {
+                "messages": messages,
+                "title": title,
+                "updated_at": datetime.utcnow()
+            }},
             upsert=True
         )
         print(f"[DEBUG] Matched {result.matched_count}, Modified {result.modified_count}")
@@ -115,6 +121,23 @@ def clear_history(session_id: str):
     print(f"[DEBUG] Deleted {result.deleted_count} document(s) for session_id {session_id}")
 
 # ----------------------------
+# Hàm lấy tất cả session
+# ----------------------------
+def get_all_sessions():
+    sessions = collection.find({}, {"session_id": 1, "title": 1})
+    return [{"session_id": s["session_id"], "title": s.get("title", "")} for s in sessions]
+
+# ----------------------------
+# Hàm hiển thị history session (debug)
+# ----------------------------
+def display_session_history(session_id: str):
+    messages = get_history_messages(session_id)
+    print(f"--- Chat history for session: {session_id} ---")
+    for m in messages:
+        print(f"{m['role'].upper()}: {m['content']}")
+    print("--- End of history ---")
+
+# ----------------------------
 # Test thử
 # ----------------------------
 if __name__ == "__main__":
@@ -126,3 +149,5 @@ if __name__ == "__main__":
     memory.add_ai_message("Hi there!")
 
     print("Chat history in MongoDB:", get_history_messages(session_id))
+    print("All sessions:", get_all_sessions())
+    display_session_history(session_id)
