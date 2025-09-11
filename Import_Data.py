@@ -19,7 +19,7 @@ COLLECTION_NAME = os.getenv("COLLECTION_NAME", "luat_hon_nhan_va_gia_dinh_2014")
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "256"))
 QDRANT_TIMEOUT = int(os.getenv("QDRANT_TIMEOUT", "120"))
 
-DATA_FILE = "hn2014_chunks.json"  # đổi nếu cần
+DATA_FILE = "hn2014_chunks.json"
 
 # ============ Kết nối Qdrant ============
 client = QdrantClient(

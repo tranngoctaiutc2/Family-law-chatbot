@@ -2,47 +2,48 @@
 # -*- coding: utf-8 -*-
 
 """
-chunking.py
------------
-Pass 1 (pre-scan): Đếm CHƯƠNG & ĐIỀU ở đầu dòng.
-Pass 2 (strict): Chương N -> chỉ chấp nhận Chương N+1; Điều k -> chỉ chấp nhận Điều k+1.
-- Nếu thiếu N+1/k+1 trong pre-scan => dừng, báo rõ.
-- Nếu gặp số nhảy cóc và N+1/k+1 có trong file => bỏ qua cho đến khi gặp đúng số.
+law_chunk_agent.py
+------------------
+Flow:
+1) Nhận file (.docx/.txt) -> đọc & chuẩn hoá dòng
+2) Chunking strict (Chương/Điều/Khoản/Điểm; chuỗi điểm phải bắt đầu a); tiêm intro khoản vào mọi điểm)
+3) (Tuỳ chọn) Khi có cờ --AI: gọi Gemini (model cố định: gemini-2.5-flash) để RÀ SOÁT chunking.
+   - Nếu phát hiện vấn đề → in báo cáo + ghi <output>.issues.json
+   - Nếu OK → ghi <output>.json (mảng chunks)
 
-Micro-chunk:
-- Điều (intro nếu không có khoản) -> Khoản -> Điểm
-- Khoản: PHẢI dạng "1." (số + dấu chấm)
-- Điểm: PHẢI dạng "a)" (có dấu )). Chỉ bắt chuỗi điểm nếu mở đầu là a).
-- Nếu khoản có điểm: KHÔNG sinh chunk "Khoản X"; intro khoản được lưu và
-  được TIÊM vào content của mọi điểm (a/b/c...), ví dụ:
-  "Khoản 2, điểm b) Cấm các hành vi sau đây:\nTảo hôn, …"
 
-Chạy:
-python chunking.py --input "luat_hon_nhan_va_gia_dinh.docx" --output "hn2014_chunks.json" --law-no "52/2014/QH13" --law-title "Luật Hôn nhân và Gia đình" --law-id "HN2014"
+# Chỉ chunking, KHÔNG gọi Gemini:
+python AI_Agent_Chunking.py --input "luat_hon_nhan_va_gia_dinh.docx" --output "hn2014_chunks.json" --law-no "52/2014/QH13" --law-title "Luật Hôn nhân và Gia đình" --law-id "HN2014"
+
+# Chunking + gọi Gemini đánh giá (--AI):
+python AI_Agent_Chunking.py --input "luat_hon_nhan_va_gia_dinh.docx" --output "hn2014_chunks.json" --AI --law-no "52/2014/QH13" --law-title "Luật Hôn nhân và Gia đình" --law-id "HN2014"
+
 """
-
 import argparse
 import json
+import os
 import pathlib
 import re
 import sys
 from typing import List, Dict, Optional, Tuple
 
+from dotenv import load_dotenv  # pip install python-dotenv
+
+# ====== CẤU HÌNH AGENT ======
+GEMINI_MODEL_NAME = "gemini-2.5-flash"  # cố định theo yêu cầu
+
 # ===== Regex (đầu dòng) =====
 ARTICLE_RE = re.compile(r'^Điều\s+(\d+)\s*[\.:]?\s*(.*)$', re.UNICODE)
 CHAPTER_RE = re.compile(r'^Chương\s+([IVXLCDM]+)\s*(.*)$', re.UNICODE | re.IGNORECASE)
 SECTION_RE = re.compile(r'^Mục\s+(\d+)\s*[:\-]?\s*(.*)$', re.UNICODE | re.IGNORECASE)
-# Khoản: PHẢI "1." (số + dấu chấm)
-CLAUSE_RE = re.compile(r'^\s*(\d+)\.\s*(.*)$', re.UNICODE)
-# Điểm: PHẢI "a)" (bắt buộc có ')')
-POINT_RE = re.compile(r'^\s*([a-zA-ZđĐ])\)\s+(.*)$', re.UNICODE)
+CLAUSE_RE = re.compile(r'^\s*(\d+)\.\s*(.*)$', re.UNICODE)  # Khoản: PHẢI "1."
+POINT_RE  = re.compile(r'^\s*([a-zA-ZđĐ])\)\s+(.*)$', re.UNICODE)  # Điểm: PHẢI "a)"
 
 # ===== .docx reader =====
 try:
     from docx import Document  # pip install python-docx
 except ImportError:
     Document = None
-
 
 def read_text(input_path: pathlib.Path) -> str:
     suf = input_path.suffix.lower()
@@ -56,15 +57,11 @@ def read_text(input_path: pathlib.Path) -> str:
     else:
         raise RuntimeError("Chỉ hỗ trợ .docx và .txt (hãy Save As .doc → .docx).")
 
-
 def normalize_lines(text: str) -> List[str]:
     return [re.sub(r'\s+$', '', ln) for ln in text.splitlines()]
 
-
 # ===== Roman → int =====
 ROMAN_MAP = {'I': 1, 'V': 5, 'X': 10, 'L': 50, 'C': 100, 'D': 500, 'M': 1000}
-
-
 def roman_to_int(s: str) -> Optional[int]:
     s = s.upper().strip()
     if not s or any(ch not in ROMAN_MAP for ch in s):
@@ -79,7 +76,6 @@ def roman_to_int(s: str) -> Optional[int]:
             total += val
             prev = val
     return total
-
 
 # ===== PASS 1: Pre-scan CHƯƠNG/ĐIỀU (đầu dòng) =====
 def prescan(lines: List[str]) -> Tuple[List[int], List[int], List[str], List[str]]:
@@ -107,13 +103,26 @@ def prescan(lines: List[str]) -> Tuple[List[int], List[int], List[str], List[str
             continue
     return chapters_nums, articles_nums, chapters_labels, article_titles_seen
 
-
-# ===== Helper: Điều X {tiêu đề điều} =====
 def build_article_header(article_no: int, article_title: str) -> str:
-    """Trả về chuỗi 'Điều X {tiêu đề điều}' (bỏ phần tiêu đề nếu trống)."""
     t = (article_title or "").strip()
     return f"Điều {article_no}" + (f" {t}" if t else "")
 
+# ===== Heuristic intro Điều dành cho các khoản =====
+INTRO_CUE_PAT = re.compile(r'(sau đây|bao gồm|gồm các|quy định như sau)\s*:\s*$', re.IGNORECASE | re.UNICODE)
+def is_intro_text_for_clauses(text: str) -> bool:
+    """
+    Heuristic: intro Điều áp dụng cho các khoản nếu:
+      - Kết thúc bằng ':' HOẶC
+      - Chứa các cụm phổ biến ('sau đây:', 'bao gồm:', 'quy định như sau:'...)
+    """
+    if not text:
+        return False
+    t = text.strip()
+    if t.endswith(':'):
+        return True
+    if INTRO_CUE_PAT.search(t):
+        return True
+    return False
 
 # ===== Flush helpers =====
 def flush_article_intro(chunks, base, stats, article_no, article_title, article_intro_buf, chapter, section, citations):
@@ -132,8 +141,8 @@ def flush_article_intro(chunks, base, stats, article_no, article_title, article_
     stats["article_intro"] += 1
     citations.append(exact)
 
-
-def flush_clause(chunks, base, stats, article_no, article_title, clause_no, content, chapter, section, citations):
+def flush_clause(chunks, base, stats, article_no, article_title, clause_no, content,
+                 chapter, section, citations, clause_intro: Optional[str] = None):
     content = (content or "").strip()
     if not content:
         return
@@ -144,19 +153,24 @@ def flush_clause(chunks, base, stats, article_no, article_title, clause_no, cont
         "article_no": article_no, "article_title": article_title,
         "clause_no": clause_no, "exact_citation": exact
     }
-    # Bổ sung tiêu đề điều vào content
     art_hdr = build_article_header(article_no, article_title)
-    full_content = f"{art_hdr} Khoản {clause_no}. {content}"
+
+    # TIÊM intro Điều vào khoản (nếu có)
+    if clause_intro:
+        intro = clause_intro.rstrip().rstrip(':') + ':'
+        full_content = f"{art_hdr} Khoản {clause_no} {intro}\n{content}"
+        meta["clause_intro"] = clause_intro
+    else:
+        full_content = f"{art_hdr} Khoản {clause_no}. {content}"
+
     chunks.append({"id": cid, "content": full_content, "metadata": meta})
     stats["clauses"] += 1
     citations.append(exact)
-
 
 def flush_point(chunks, base, stats, article_no, article_title, clause_no, letter, content, chapter, section, citations, clause_intro: Optional[str] = None):
     content = (content or "").strip()
     if not content:
         return
-    # TIÊM intro khoản vào đầu nội dung điểm (nếu có)
     if clause_intro:
         intro = clause_intro.rstrip().rstrip(':') + ':'
         content = f"{intro}\n{content}"
@@ -171,11 +185,10 @@ def flush_point(chunks, base, stats, article_no, article_title, clause_no, lette
     }
     if clause_intro:
         meta["clause_intro"] = clause_intro
-    # Bổ sung tiêu đề điều vào content
     art_hdr = build_article_header(article_no, article_title)
 
     if clause_intro:
-        intro = clause_intro.rstrip().rstrip(':')  # bỏ dấu ':' cuối nếu có
+        intro = clause_intro.rstrip().rstrip(':')
         full_content = f"{art_hdr} Khoản {clause_no} {intro}, điểm {letter})\n{content}"
     else:
         full_content = f"{art_hdr} Khoản {clause_no}, điểm {letter}) {content}"
@@ -183,7 +196,6 @@ def flush_point(chunks, base, stats, article_no, article_title, clause_no, lette
     chunks.append({"id": cid, "content": full_content, "metadata": meta})
     stats["points"] += 1
     citations.append(exact)
-
 
 # ===== PASS 2: Chunk strict =====
 def chunk_strict(lines: List[str], base: Dict, chapters_set: set, articles_set: set):
@@ -205,8 +217,11 @@ def chunk_strict(lines: List[str], base: Dict, chapters_set: set, articles_set: 
 
     clause_no: Optional[int] = None
     clause_buf: str = ""
-    # intro của khoản sẽ được tiêm vào mọi điểm
+    # intro của khoản → tiêm vào mọi điểm của khoản
     clause_intro_current: Optional[str] = None
+    # intro của điều → tiêm vào mọi khoản của điều
+    article_clause_intro_current: Optional[str] = None
+
     in_points: bool = False
     point_letter: Optional[str] = None
     point_buf: str = ""
@@ -224,7 +239,7 @@ def chunk_strict(lines: List[str], base: Dict, chapters_set: set, articles_set: 
                         point_buf, chapter_label, section_label, citations, clause_intro_current)
         elif clause_buf.strip():
             flush_clause(chunks, base, stats, article_no, article_title, clause_no, clause_buf,
-                         chapter_label, section_label, citations)
+                         chapter_label, section_label, citations, article_clause_intro_current)
         article_has_any_chunk = True
         clause_no, clause_buf, in_points, point_letter, point_buf = None, "", False, None, ""
         clause_intro_current = None
@@ -262,6 +277,7 @@ def chunk_strict(lines: List[str], base: Dict, chapters_set: set, articles_set: 
                     point_letter = None
                     point_buf = ""
                     clause_intro_current = None
+                    article_clause_intro_current = None
                     continue
                 else:
                     continue
@@ -271,7 +287,6 @@ def chunk_strict(lines: List[str], base: Dict, chapters_set: set, articles_set: 
                 break
             continue
 
-        # bổ sung tiêu đề điều ở dòng sau nếu cần
         if expecting_article_title:
             if not (CHAPTER_RE.match(line) or SECTION_RE.match(line) or CLAUSE_RE.match(line) or POINT_RE.match(line) or ARTICLE_RE.match(line)):
                 article_title = line
@@ -283,7 +298,6 @@ def chunk_strict(lines: List[str], base: Dict, chapters_set: set, articles_set: 
         # CHƯƠNG
         m_ch = CHAPTER_RE.match(line)
         if m_ch:
-            # ĐÓNG hoàn toàn điều trước khi sang chương mới
             close_clause()
             if article_no is not None:
                 close_article_if_needed()
@@ -291,6 +305,7 @@ def chunk_strict(lines: List[str], base: Dict, chapters_set: set, articles_set: 
             article_title = ""
             article_intro_buf = ""
             expecting_article_title = False
+            article_clause_intro_current = None
 
             roman = m_ch.group(1).strip()
             ch_num = roman_to_int(roman) or 0
@@ -323,7 +338,6 @@ def chunk_strict(lines: List[str], base: Dict, chapters_set: set, articles_set: 
         # MỤC
         m_sec = SECTION_RE.match(line)
         if m_sec:
-            # Ngắt điều tương tự khi sang mục mới
             close_clause()
             if article_no is not None:
                 close_article_if_needed()
@@ -331,6 +345,7 @@ def chunk_strict(lines: List[str], base: Dict, chapters_set: set, articles_set: 
             article_title = ""
             article_intro_buf = ""
             expecting_article_title = False
+            article_clause_intro_current = None
 
             sec_no = m_sec.group(1).strip()
             sec_title = (m_sec.group(2) or "").strip()
@@ -360,6 +375,7 @@ def chunk_strict(lines: List[str], base: Dict, chapters_set: set, articles_set: 
                 point_letter = None
                 point_buf = ""
                 clause_intro_current = None
+                article_clause_intro_current = None
                 continue
             else:
                 if a_no == expected_article:
@@ -378,6 +394,7 @@ def chunk_strict(lines: List[str], base: Dict, chapters_set: set, articles_set: 
                     point_letter = None
                     point_buf = ""
                     clause_intro_current = None
+                    article_clause_intro_current = None
                     continue
                 elif a_no > expected_article:
                     if expected_article not in articles_set:
@@ -391,19 +408,23 @@ def chunk_strict(lines: List[str], base: Dict, chapters_set: set, articles_set: 
                     warnings.append(f"Bỏ qua Điều {a_no} (Điều lùi số).")
                     continue
 
-        # nếu chưa vào điều nào thì bỏ qua
         if article_no is None:
             continue
 
-        # KHOẢN — PHẢI "1." (số + dấu chấm)
+        # KHOẢN
         m_k = CLAUSE_RE.match(line)
         if m_k and m_k.group(1).isdigit():
-            # Nếu đang có intro điều và chuẩn bị vào khoản đầu tiên → flush intro như "Điều X"
-            if article_intro_buf.strip():
+            # Nếu Điều có intro 'giới thiệu' → lưu lại để tiêm cho mọi khoản, KHÔNG flush chunk intro Điều
+            if article_intro_buf.strip() and is_intro_text_for_clauses(article_intro_buf):
+                article_clause_intro_current = article_intro_buf.strip()
+                article_intro_buf = ""
+            elif article_intro_buf.strip():
+                # Intro không phải dạng 'giới thiệu' → tạo chunk Điều intro như cũ
                 flush_article_intro(chunks, base, stats, article_no, article_title, article_intro_buf,
                                     chapter_label, section_label, citations)
                 article_intro_buf = ""
                 article_has_any_chunk = True
+
             close_clause()
             clause_no = int(m_k.group(1))
             clause_buf = (m_k.group(2) or "").strip()
@@ -413,7 +434,7 @@ def chunk_strict(lines: List[str], base: Dict, chapters_set: set, articles_set: 
             clause_intro_current = None
             continue
 
-        # ĐIỂM — chỉ bắt đầu chuỗi điểm nếu mở đầu là a)
+        # ĐIỂM — chuỗi điểm chỉ bắt đầu nếu mở bằng a)
         m_p = POINT_RE.match(line)
         if m_p and clause_no is not None:
             letter = m_p.group(1).lower()
@@ -421,7 +442,7 @@ def chunk_strict(lines: List[str], base: Dict, chapters_set: set, articles_set: 
 
             if not in_points:
                 if letter != 'a':
-                    # không coi là điểm -> gộp vào nội dung khoản
+                    # không coi là điểm → nhập vào nội dung khoản
                     clause_buf += ("\n" if clause_buf else "") + f"{letter}) {text}"
                     continue
                 # bắt đầu chuỗi điểm với 'a)' — KHÔNG flush chunk "Khoản X"
@@ -449,7 +470,7 @@ def chunk_strict(lines: List[str], base: Dict, chapters_set: set, articles_set: 
             else:
                 clause_buf += ("\n" if clause_buf else "") + line
         else:
-            # intro điều (chỉ tồn tại trước khi có khoản đầu tiên)
+            # intro Điều (trước khi có khoản đầu tiên)
             article_intro_buf += ("\n" if article_intro_buf else "") + line
 
     # Kết thúc file
@@ -470,16 +491,146 @@ def chunk_strict(lines: List[str], base: Dict, chapters_set: set, articles_set: 
     }
     return chunks, summary
 
+# ===================== GEMINI EVALUATION AGENT =====================
+
+GEMINI_PROMPT = """Bạn là chuyên gia pháp điển hoá & kiểm thử dữ liệu luật.
+Tôi gửi cho bạn:
+1) Summary thống kê & cảnh báo từ bộ chunking.
+2) Một số "excerpts" (trích đoạn nguyên văn) đại diện.
+3) Danh mục chunks (id + metadata + content rút gọn).
+
+Nhiệm vụ:
+- PHÁT HIỆN BẤT THƯỜNG (anomalies) trong chunking, ví dụ:
+  * Sai thứ tự/chưa “strict” (nhảy cóc Chương/Điều/Khoản/Điểm).
+  * Nhận diện nhầm “Khoản” (không phải dạng `1.`) hoặc “Điểm” (không phải `a)`).
+  * Không tiêm intro khoản vào điểm khi đã có chuỗi điểm.
+  * Thiếu/bỏ sót nội dung so với excerpts.
+  * Metadata không khớp: article_no/clause_no/point_letter/exact_citation.
+  * Đóng mở chuỗi điểm sai (bắt đầu không phải “a)”, chèn nội dung thường vào giữa).
+  * Nội dung “Điều” không có khoản nhưng không sinh chunk intro.
+- GỢI Ý SỬA: chỉ rõ vị trí (id / exact_citation), mô tả vấn đề, cách khắc phục.
+- Nếu KHÔNG thấy vấn đề, xác nhận “ok” và nêu ngắn gọn cơ sở kết luận.
+
+Hãy TRẢ LỜI **CHỈ** ở dạng JSON theo schema:
+{
+  "status": "ok" | "issues_found",
+  "confidence": 0.0-1.0,
+  "issues": [
+    {
+      "id": "chuỗi id chunk hoặc mô tả vị trí",
+      "citation": "Điều ... khoản ... điểm ...",
+      "severity": "low|medium|high",
+      "category": "ordering|regex|metadata|omission|points_chain|format|other",
+      "message": "Mô tả ngắn gọn vấn đề",
+      "suggestion": "Cách sửa ngắn gọn"
+    }
+  ],
+  "notes": "Ghi chú ngắn (tuỳ chọn)"
+}
+Trả JSON hợp lệ. Không giải thích ngoài JSON.
+"""
+
+def _shorten_text(s: str, max_len: int = 500) -> str:
+    if len(s) <= max_len:
+        return s
+    head = s[: max_len // 2].rstrip()
+    tail = s[- max_len // 2 :].lstrip()
+    return head + "\n...\n" + tail
+
+def build_review_payload(chunks: List[Dict], summary: Dict, raw_text: str, sample_excerpts_chars: int = 8000):
+    n = len(raw_text)
+    if n <= sample_excerpts_chars:
+        excerpts = raw_text
+    else:
+        k = sample_excerpts_chars // 3
+        excerpts = raw_text[:k] + "\n...\n" + raw_text[n//2 - k//2 : n//2 + k//2] + "\n...\n" + raw_text[-k:]
+
+    def lite(c):
+        return {
+            "id": c.get("id"),
+            "metadata": c.get("metadata"),
+            "content_preview": _shorten_text(c.get("content",""), 700)
+        }
+
+    chunks_lite = [lite(c) for c in chunks]
+    return {
+        "summary": summary,
+        "excerpts": excerpts,
+        "chunks_preview": chunks_lite[:1200]
+    }
+
+def call_gemini_review(payload: Dict, api_key: Optional[str] = None) -> Dict:
+    """
+    Gọi Gemini (model cố định GEMINI_MODEL_NAME) và ép trả JSON.
+    API key lấy từ .env (GEMINI_API_KEY).
+    """
+    api_key = api_key or os.getenv("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("Thiếu GEMINI_API_KEY trong môi trường (.env).")
+
+    # import tại chỗ, chỉ khi --AI bật
+    import google.generativeai as genai
+    genai.configure(api_key=api_key)
+
+    generation_config = {
+        "temperature": 0.2,
+        "top_p": 0.9,
+        "top_k": 40,
+        "response_mime_type": "application/json",
+    }
+    model = genai.GenerativeModel(GEMINI_MODEL_NAME, generation_config=generation_config)
+    prompt_parts = [
+        {"role": "user", "parts": [{"text": GEMINI_PROMPT}]},
+        {"role": "user", "parts": [{"text": json.dumps(payload, ensure_ascii=False)}]},
+    ]
+    resp = model.generate_content(prompt_parts)
+    raw = getattr(resp, "text", None) or (
+        resp.candidates and resp.candidates[0].content.parts[0].text
+    )
+    if not raw:
+        raise RuntimeError("Gemini không trả ra nội dung.")
+    try:
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            raise ValueError("JSON không phải object")
+        data.setdefault("status", "issues_found")
+        data.setdefault("issues", [])
+        data.setdefault("confidence", 0.0)
+        return data
+    except Exception as e:
+        return {
+            "status": "issues_found",
+            "confidence": 0.0,
+            "issues": [{
+                "id": "PARSER",
+                "citation": "",
+                "severity": "high",
+                "category": "other",
+                "message": f"Không parse được JSON từ Gemini: {e}",
+                "suggestion": "Chạy lại hoặc giảm excerpts."
+            }],
+            "notes": raw[:2000]
+        }
+
+# ===================== CLI MAIN =====================
 
 def main():
+    load_dotenv()  # nạp .env (lấy GEMINI_API_KEY)
+
     ap = argparse.ArgumentParser(
-        description="Chunk luật (strict Chương/Điều; Khoản '1.'; Điểm 'a)'; tiêm intro khoản vào mọi điểm; và bổ sung 'Điều X {tiêu đề điều}' vào content của khoản/điểm)"
+        description="Chunk luật (strict) + (tuỳ chọn) gọi Gemini để thẩm định (--AI)."
     )
     ap.add_argument("--input", required=True, help="Đường dẫn .docx hoặc .txt (UTF-8)")
-    ap.add_argument("--output", required=True, help="Đường dẫn file .json để xuất chunks")
+    ap.add_argument("--output", required=True, help="Đường dẫn file .json để xuất chunks (khi OK)")
     ap.add_argument("--law-no", default="52/2014/QH13")
     ap.add_argument("--law-title", default="Luật Hôn nhân và Gia đình")
     ap.add_argument("--law-id", default="LAW")
+
+    # Chỉ bật AI khi có cờ --AI
+    ap.add_argument("--AI", action="store_true", help="BẬT gọi Gemini (mặc định KHÔNG gọi).")
+    ap.add_argument("--sample-excerpts", type=int, default=8000, help="Ký tự excerpts gửi Gemini (khi --AI).")
+    ap.add_argument("--strict-ok-only", action="store_true", help="Chỉ ghi chunks nếu Gemini trả 'ok' (chỉ khi --AI).")
+
     args = ap.parse_args()
 
     in_path = pathlib.Path(args.input)
@@ -487,57 +638,96 @@ def main():
         print(f"❌ Không tìm thấy file: {in_path}", file=sys.stderr)
         sys.exit(1)
 
+    # Đọc toàn văn
     try:
-        text = read_text(in_path)
+        raw_text = read_text(in_path)
     except Exception as e:
         print(f"❌ Lỗi đọc file: {e}", file=sys.stderr)
         sys.exit(1)
-
-    lines = normalize_lines(text)
+    lines = normalize_lines(raw_text)
 
     # PASS 1
     chapters_nums, articles_nums, chapters_labels, _ = prescan(lines)
     chapters_set, articles_set = set(chapters_nums), set(articles_nums)
     print("===== PRE-SCAN =====")
-    print(f"Tổng CHƯƠNG (đầu dòng): {len(chapters_nums)}  --> {', '.join(map(str, chapters_nums[:20]))}{' ...' if len(chapters_nums) > 20 else ''}")
-    print(f"Tổng ĐIỀU   (đầu dòng): {len(articles_nums)}  --> {', '.join(map(str, articles_nums[:20]))}{' ...' if len(articles_nums) > 20 else ''}")
+    print(f"Tổng CHƯƠNG (đầu dòng): {len(chapters_nums)}")
+    print(f"Tổng ĐIỀU   (đầu dòng): {len(articles_nums)}")
 
-    # PASS 2
+    # PASS 2 (chunk strict)
     base = {"law_no": args.law_no, "law_title": args.law_title, "law_id": args.law_id}
     chunks, summary = chunk_strict(lines, base, chapters_set, articles_set)
 
-    # Xuất JSON
+    # In tóm tắt
+    print("\n===== TÓM TẮT CHUNKING =====")
+    print(f"Số CHƯƠNG gặp (strict): {len(summary['chapters_seen'])}")
+    print(f"Số ĐIỀU:               {summary['articles']}")
+    print(f"Số ĐIỀU (intro):       {summary['article_intro']}")
+    print(f"Số KHOẢN:              {summary['clauses']}")
+    print(f"Số ĐIỂM:               {summary['points']}")
+    print(f"Tổng chunk:            {summary['total_chunks']}")
+    if summary["warnings"]:
+        print(f"- Cảnh báo: {len(summary['warnings'])}")
+    if summary["halted_reason"]:
+        print(f"- Dừng strict tại: {summary['halted_reason']}")
+
+    # Nếu KHÔNG bật --AI: ghi luôn chunks và kết thúc
+    if not args.AI:
+        out_path = pathlib.Path(args.output)
+        out_path.write_text(json.dumps(chunks, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"\n✓ (No-AI) Đã ghi {len(chunks)} chunks vào: {out_path}\n")
+        sys.exit(0)
+
+    # ===== Khi --AI bật: gọi Gemini để thẩm định =====
+    payload = build_review_payload(
+        chunks=chunks,
+        summary=summary,
+        raw_text=raw_text,
+        sample_excerpts_chars=max(2000, args.sample_excerpts)
+    )
+
+    print("\n===== GỌI GEMINI (gemini-2.5-flash) ĐÁNH GIÁ =====")
+    try:
+        review = call_gemini_review(payload)
+    except Exception as e:
+        print(f"❌ Lỗi gọi Gemini: {e}", file=sys.stderr)
+        if args.strict_ok_only:
+            sys.exit(2)
+        else:
+            out_path = pathlib.Path(args.output)
+            out_path.write_text(json.dumps(chunks, ensure_ascii=False, indent=2), encoding="utf-8")
+            print(f"⚠️ Không thẩm định được. Vẫn ghi chunks vào: {out_path}")
+            sys.exit(0)
+
+    status = review.get("status", "issues_found")
+    confidence = review.get("confidence", 0.0)
+    issues = review.get("issues", []) or []
+    notes = review.get("notes", "")
+
+    print(f"- Trạng thái: {status} | Confidence: {confidence:.2f}")
+    if notes:
+        print(f"- Ghi chú: {notes[:4000]}")
+
+    if issues:
+        print("\n===== BÁO CÁO VẤN ĐỀ =====")
+        for i, it in enumerate(issues, 1):
+            print(f"{i:02d}. [{it.get('severity','?')}] ({it.get('category','other')}) "
+                  f"{it.get('citation') or it.get('id') or ''}")
+            print(f"    - {it.get('message','(no message)')}")
+            if it.get('suggestion'):
+                print(f"    → Gợi ý: {it['suggestion']}")
+        issues_path = pathlib.Path(args.output).with_suffix(".issues.json")
+        issues_path.write_text(json.dumps(review, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"\n⚠️ Đã ghi báo cáo vấn đề: {issues_path}")
+
+        if args.strict_ok_only:
+            print("❌ --strict-ok-only: Không ghi chunks vì Gemini chưa xác nhận 'ok'.")
+            sys.exit(3)
+
+    # Ghi chunks (khi ok hoặc không bật strict-ok-only)
     out_path = pathlib.Path(args.output)
     out_path.write_text(json.dumps(chunks, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"\n✓ Đã ghi {len(chunks)} chunks vào: {out_path}")
-
-    # TÓM TẮT
-    print("\n===== TÓM TẮT =====")
-    print(f"Số CHƯƠNG gặp (strict): {len(summary['chapters_seen'])}")
-    for ch in summary["chapters_seen"]:
-        print(f"  - {ch}")
-    print(f"Số ĐIỀU:             {summary['articles']}")
-    print(f"Số ĐIỀU (intro):     {summary['article_intro']}   # Điều không có Khoản → chunk 'Điều X'")
-    print(f"Số KHOẢN:            {summary['clauses']}")
-    print(f"Số ĐIỂM:             {summary['points']}")
-    print(f"Tổng chunk:          {summary['total_chunks']}")
-
-    # EXACT CITATIONS
-    print("\n===== EXACT CITATIONS (theo thứ tự xuất hiện) =====")
-    for i, cit in enumerate(summary["citations"], 1):
-        print(f"{i:04d}. {cit}")
-
-    # WARNINGS & HALT
-    if summary["warnings"]:
-        print("\n===== CẢNH BÁO =====")
-        for w in summary["warnings"]:
-            print("- " + w)
-    if summary["halted_reason"]:
-        print("\n===== DỪNG DO STRICT =====")
-        print(summary["halted_reason"])
-
     print("\n✓ Hoàn tất.\n")
-
 
 if __name__ == "__main__":
     main()
