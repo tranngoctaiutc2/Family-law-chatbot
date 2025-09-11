@@ -1,4 +1,3 @@
-# botchat_honnhan.py
 import os
 from datetime import datetime
 from textwrap import dedent
@@ -8,15 +7,17 @@ from dotenv import load_dotenv
 from qdrant_client import QdrantClient
 from sentence_transformers import SentenceTransformer
 import google.generativeai as genai
+import uuid
+from memory import get_memory, get_history_messages, clear_history
 
 # ================== ENV ==================
 load_dotenv()
 QDRANT_URL = os.getenv("QDRANT_URL", "").strip()
-QDRANT_API_KEY = os.getenv("QDRANT_API_KEY", "").strip()
-COLLECTION_NAME = os.getenv("COLLECTION_NAME", "luat_hon_nhan_va_gia_dinh_2014")
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "BAAI/bge-m3")
+QDRANT_API_KEY =  os.getenv("QDRANT_API_KEY", "").strip()
+COLLECTION_NAME = os.getenv("COLLECTION_NAME", "")
+EMBEDDING_MODEL =  os.getenv("EMBEDDING_MODEL", "BAAI/bge-m3")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL_ID = os.getenv("GEMINI_MODEL_ID", "gemini-2.5-flash")
+GEMINI_MODEL_ID = os.getenv("GEMINI_MODEL_ID", "models/gemini-1.5-flash")
 
 if not (QDRANT_URL and QDRANT_API_KEY and GEMINI_API_KEY):
     raise RuntimeError("Thiếu QDRANT_URL / QDRANT_API_KEY / GEMINI_API_KEY trong .env")
@@ -29,24 +30,28 @@ genai.configure(api_key=GEMINI_API_KEY)
 gemini_model = genai.GenerativeModel(GEMINI_MODEL_ID)
 
 # ================== SEARCH HELPERS ==================
-def search_law(query: str, top_k: int = 15):
+def search_law(query: str, top_k: int = 7):
     """
     Tìm kiếm trong Qdrant và trả về danh sách điều luật + điểm tương đồng.
     Với BAAI/bge-m3 nên normalize để kết quả ổn định.
     """
     vec = embedder.encode([query], normalize_embeddings=True)[0].tolist()
-    results = client.search(
-        collection_name=COLLECTION_NAME,
-        query_vector=vec,
-        limit=max(1, min(int(top_k), 50)),
-        with_payload=True
-    )
+    try:
+        results = client.query_points(
+            collection_name=COLLECTION_NAME,
+            query=vec,
+            limit=max(1, min(int(top_k), 50)),
+            with_payload=True
+        ).points
+    except Exception as e:
+        print(f"[ERROR] Qdrant query failed: {e}")
+        return []
 
     docs = []
     for r in results:
         p = r.payload or {}
         docs.append({
-            "citation": p.get("exact_citation", ""),     # ví dụ: "Điều 56, Khoản 1, Luật HN&GĐ 2014"
+            "citation": p.get("exact_citation", ""),
             "chapter": p.get("chapter", ""),
             "article_no": p.get("article_no", ""),
             "article_title": p.get("article_title", ""),
@@ -157,18 +162,19 @@ def is_legal_query(user_query: str) -> bool:
         return any(k in q for k in keywords)
 
 # ================== PROMPT ==================
-def build_prompt(query: str, docs, history_msgs):
-    # Lịch sử gọn 6 lượt gần nhất
+def build_prompt(query: str, docs, history_msgs, law_name="Luật Hôn nhân và Gia đình 2014"):
+    # Lấy tối đa 5 lượt hội thoại gần nhất
     history_block = ""
     if history_msgs:
         lines = []
-        for i, m in enumerate(history_msgs[-6:], 1):
+        for i, m in enumerate(history_msgs[-5:], 1):
             role = m.get("role", "")
             content = m.get("content", "")
-            lines.append(f"- {i}. {role}: {content}")
+            role_label = "Người dùng" if role == "user" else "Trợ lý"
+            lines.append(f"- {i}. {role_label}: {content}")
         history_block = "\nLịch sử hội thoại gần đây:\n" + "\n".join(lines)
 
-    # Danh sách Top-K điều luật cho mô hình tự chọn và viện dẫn
+    # Danh sách Top-K điều luật để mô hình chọn
     context_lines = []
     for idx, d in enumerate(docs, 1):
         cited, chapter, title = law_line(d)
@@ -177,45 +183,55 @@ def build_prompt(query: str, docs, history_msgs):
     context = "\n".join(context_lines) if context_lines else "❌ Không có điều luật nào."
 
     prompt = dedent(f"""
-    Bạn là **trợ lý pháp lý** chuyên về **Luật Hôn nhân và Gia đình Việt Nam**, trả lời với **phong thái của một luật sư**.
-    Chức năng chính của bạn:
-    - Giải đáp thắc mắc về pháp luật hôn nhân và gia đình.
-    - Tìm kiếm các điều luật được yêu cầu (đã cung cấp bên dưới) và trả lời người dùng.
-    - Khi có danh sách Top-K điều luật, **tự chọn các điều phù hợp nhất** để trả lời và **phải trích dẫn chi tiết** (Điều/Khoản/Điểm, nguyên văn nội dung), kèm **giải thích rõ ràng**.
-    - Nếu **không có điều luật phù hợp** trong danh sách, nói rõ **không có**; **tuyệt đối không được bịa**.
+    Bạn là **trợ lý pháp luật** chuyên phân tích và tư vấn theo **{law_name}**. 
+    Vai trò: giải thích luật một cách chính xác nhưng dễ hiểu, giúp người dân nắm rõ quy định và áp dụng trong đời sống. 
+    Không phải chỉ đọc luật, mà cần làm rõ ý nghĩa thực tế.
 
-    Yêu cầu trả lời đầy đủ, chi tiết, dễ hiểu, dễ áp dụng đối với những câu hỏi phức tạp, còn những câu hỏi đơn giản thì có thể trả lời ngắn gọn nhưng vẫn đầy đủ ý:
-    - Luôn đặt câu trả lời trong bối cảnh pháp luật Việt Nam hiện hành.
-    - Văn phong chuẩn mực, mạch lạc, lập luận theo logic pháp lý.
-    - Cấu trúc đề xuất:
-      1) **Tóm tắt câu hỏi/tình huống** (nếu phù hợp)
-      2) **Cơ sở pháp lý được trích dẫn** (chỉ từ các điều luật dưới đây; ghi rõ Điều/Khoản/Điểm; trích NGUYÊN VĂN)
-      3) **Phân tích** (giải thích và áp dụng vào tình huống; nêu điều kiện áp dụng/ngoại lệ nếu có)
-      4) **Kết luận/Hướng xử lý**
-      5) **Lưu ý**: "Thông tin chỉ mang tính tham khảo, không thay thế tư vấn pháp lý chính thức."
-    - Nếu câu hỏi **không thuộc phạm vi** Luật HN&GĐ 2014: lịch sự từ chối và nêu phạm vi bạn hỗ trợ.
+    Quy tắc bắt buộc:
+    - Chỉ trả lời dựa trên các điều luật được cung cấp bên dưới.
+    - Nếu không tìm thấy quy định phù hợp → trả lời: "Không tìm thấy quy định trong văn bản pháp luật hiện hành."
+    - Không bịa, không đưa ý kiến cá nhân ngoài phạm vi luật.
+    - Độ dài câu trả lời ≤ 350 từ.
 
-    Câu hỏi hiện tại của người dùng:
+    Yêu cầu khi trả lời:
+    - Trích dẫn ngắn gọn Điều/Khoản/Điểm và nguyên văn nội dung liên quan.
+    - Giải thích bằng ngôn ngữ dễ hiểu, gần gũi.
+    - Có thể đưa ví dụ thực tế minh họa (nếu phù hợp).
+    - Trình bày theo cấu trúc:
+      1) **Tóm tắt câu hỏi/tình huống**
+      2) **Cơ sở pháp lý** (trích dẫn ngắn gọn luật từ danh sách bên dưới)
+      3) **Phân tích** ( có ví dụ minh họa nhưng vẫn phải trích dẫn các điều luật)
+      4) **Kết luận** (dựa trên phân tích ở trên, tóm tắt vấn đề bằng ngôn ngữ dễ hiểu, nêu rõ quyền lợi của các bên, hậu quả pháp lý và hướng xử lý thực tế, tránh trích dẫn luật máy móc)
+
+
+    Câu hỏi hiện tại:
     \"\"\"{query}\"\"\"{history_block}
 
-    Các điều luật Top-K (để bạn lựa chọn khi lập luận, KHÔNG được viện dẫn ngoài danh sách này):
+    Các điều luật Top-K (bạn CHỈ được viện dẫn trong danh sách này):
     {context}
     """).strip()
 
     return prompt
+
 
 # ================== LLM STREAM ==================
 def stream_answer(prompt, temperature=0.2):
     try:
         cfg = genai.types.GenerationConfig(
             temperature=float(temperature),
+            max_output_tokens=512
         )
-        resp = gemini_model.generate_content(prompt, generation_config=cfg, stream=True)
+        resp = gemini_model.generate_content(
+            prompt, generation_config=cfg, stream=True
+        )
+
         for ch in resp:
             if getattr(ch, "text", None):
-                yield ch.text
+                yield ch.text  # xuất từng đoạn nhỏ ngay
     except Exception as e:
         yield f"\n\nLỗi gọi mô hình: {e}"
+
+
 
 # ================== STYLE ==================
 CSS = """
@@ -236,10 +252,27 @@ CSS = """
   font-size: 12px; padding: 4px 8px; border-radius: 999px;
   background:#eef2ff; color:#4338ca; border:1px solid #c7d2fe;
 }
-#chatbot { height: 560px !important; }
-.card {
-  border: 1px solid #e5e7eb; border-radius: 16px; padding: 12px; background: #ffffffaa;
-  backdrop-filter: blur(8px);
+#chatbot { 
+  height: 560px !important; 
+  overflow-y: auto; /* Thêm cuộn dọc */
+  display: flex;
+  flex-direction: column;
+}
+.chat-message {
+  margin: 8px 0;
+  padding: 8px 12px;
+  border-radius: 8px;
+  max-width: 80%;
+}
+.chat-message.user {
+  background: var(--accent);
+  color: white;
+  align-self: flex-end;
+}
+.chat-message.assistant {
+  background: #e5e7eb;
+  color: var(--brand);
+  align-self: flex-start;
 }
 .footer {
   font-size: 12px; opacity: .8; text-align:center; margin-top: 8px;
@@ -250,6 +283,110 @@ CSS = """
   overflow-y: auto;
 }
 """
+
+# ================== Hàm helper & core ==================
+def format_history(history_msgs):
+    """
+    Chuyển history_msgs sang format [{"role": "...", "content": "..."}, ...] cho gr.Chatbot
+    """
+    formatted = []
+    for msg in history_msgs:
+        role = msg.get("role")
+        content = msg.get("content", "")
+        # Gradio Chatbot chỉ nhận "user" hoặc "assistant"
+        if role in ["user", "assistant"]:
+            formatted.append({"role": role, "content": content})
+    return formatted
+
+
+def respond(message, history_msgs, k, temperature, cur_page_size, session_id):
+    if not (message and message.strip()):
+        gr.Info("Vui lòng nhập câu hỏi.")
+        return gr.update(), history_msgs, gr.update(), "", "", [], 1, "Trang 0/0", session_id
+
+    # 🔹 Generate session_id nếu chưa có
+    if session_id is None:
+        session_id = str(uuid.uuid4())
+
+    # 🔹 Chỉ load history từ DB nếu chatbot rỗng
+    if not history_msgs:
+        history_msgs = get_history_messages(session_id)
+
+    # 0) Phân loại câu hỏi
+    legal = is_legal_query(message)
+    if not legal:
+        reply = (
+            "Mình chủ yếu hỗ trợ **các vấn đề pháp lý theo Luật Hôn nhân & Gia Đình 2014**.\n\n"
+            "Bạn có thể cho mình biết tình huống pháp lý cụ thể (ví dụ: *thủ tục ly hôn, quyền nuôi con, chia tài sản, cấp dưỡng...*)? "
+            "Nếu câu hỏi không thuộc phạm vi này, mình xin phép không tra cứu để tiết kiệm tài nguyên."
+        )
+        mem = get_memory(session_id)
+        mem.add_user_message(message)
+        mem.add_ai_message(reply)
+
+        updated_history = history_msgs + [
+            {"role": "user", "content": message},
+            {"role": "assistant", "content": reply},
+        ]
+        formatted_history = format_history(updated_history)
+
+        return gr.update(value=""), formatted_history, gr.update(value="(Chưa có dữ liệu)"), reply, "", [], 1, "Trang 0/0", session_id
+
+    # 1) Tìm điều luật
+    try:
+        docs = search_law(message, top_k=int(k))
+    except Exception as e:
+        err = f"Lỗi tìm kiếm Qdrant: {e}"
+        mem = get_memory(session_id)
+        mem.add_user_message(message)
+        mem.add_ai_message(err)
+
+        updated_history = history_msgs + [
+            {"role": "user", "content": message},
+            {"role": "assistant", "content": err},
+        ]
+        formatted_history = format_history(updated_history)
+        return gr.update(value=""), formatted_history, gr.update(value="(Lỗi tra cứu)"), "", "(Lỗi tra cứu)", [], 1, "Trang 0/0", session_id
+
+    # 2) Render trang 1
+    first_page = 1
+    cites_markdown, page_label = docs_page_markdown(docs, first_page, int(cur_page_size))
+
+    # 3) Prompt
+    prompt = build_prompt(message, docs, history_msgs)
+
+    # 4) Thêm user vào memory
+    mem = get_memory(session_id)
+    mem.add_user_message(message)
+
+    # 5) Stream assistant
+    acc = ""
+    for chunk in stream_answer(prompt, temperature=float(temperature)):
+        acc += chunk
+        # Cập nhật hiển thị kiểu ChatGPT
+        temp_history = history_msgs + [
+            {"role": "user", "content": message},
+            {"role": "assistant", "content": acc},
+        ]
+        formatted_history = format_history(temp_history)
+        yield (
+            gr.update(value=""),
+            formatted_history,  # cập nhật toàn bộ history
+            gr.update(value=cites_markdown),
+            acc,
+            cites_markdown,
+            docs,
+            first_page,
+            page_label,
+            session_id  # Persist session_id
+        )
+
+    # 🔹 Sau khi stream xong → lưu vào memory
+    mem.add_ai_message(acc)
+
+def on_clear(session_id):
+    clear_history(session_id)
+    return [], "(Chưa có dữ liệu)", "", "", [], 1, "Trang 0/0", None  # Reset session_id
 
 # ================== UI ==================
 with gr.Blocks(
@@ -272,10 +409,10 @@ with gr.Blocks(
         with gr.Column(scale=3):
             chatbot = gr.Chatbot(
                 value=[],
-                type="messages",          # schema messages của Gradio 5
-                bubble_full_width=False,
+                type="messages",
                 show_copy_button=True,
                 elem_id="chatbot",
+                bubble_full_width=False,  # Tin nhắn không chiếm toàn chiều rộng
             )
             gr.Markdown(
                 "> 💡 Mẹo: Mô tả tình huống (mốc thời gian, tài sản, con chung, thỏa thuận...) để phân tích chính xác hơn.",
@@ -285,11 +422,10 @@ with gr.Blocks(
             with gr.Group():
                 gr.Markdown("### ⚙️ Tuỳ chọn", elem_classes=["card"])
                 with gr.Row():
-                    topk = gr.Slider(5, 30, value=15, step=1, label="Số điều luật lấy (Top-K)")
+                    topk = gr.Slider(5, 30, value=20, step=1, label="Số điều luật lấy (Top-K)")
                     temp = gr.Slider(0.0, 1.0, value=0.2, step=0.05, label="Temperature (Độ sáng tạo của mô hình ngôn ngữ lớn)")
             with gr.Group():
                 gr.Markdown("### 🧾 Cơ sở pháp lý (Top-K hiển thị để kiểm tra)", elem_classes=["card"])
-                # Khung Markdown có chiều cao cố định và scroll
                 cites_md = gr.Markdown(value="(Chưa có dữ liệu)", elem_id="cites_md")
                 with gr.Row():
                     prev_page = gr.Button("⬅️ Trang trước")
@@ -306,91 +442,37 @@ with gr.Blocks(
             container=True,
         )
         send = gr.Button("Gửi", variant="primary", scale=1)
-        clear = gr.Button("Xoá", variant="secondary", scale=1)
+        clear_btn = gr.Button("Xoá", variant="secondary", scale=1)
 
     # States
-    state_history = gr.State([])      # lịch sử chat theo schema messages
-    state_last_answer = gr.State("")  # vẫn giữ để tiện debug/nội bộ nếu cần
-    state_last_cites = gr.State("")   # markdown đã render
-    state_docs = gr.State([])         # lưu full docs của lần tra cứu hiện tại
-    state_page = gr.State(1)          # trang hiện tại
+    state_session = gr.State(None)  # Sửa: None để sinh UUID per session
+    state_last_answer = gr.State("")
+    state_last_cites = gr.State("")
+    state_docs = gr.State([])
+    state_page = gr.State(1)
 
-    # -------- Core Handler (Streaming) --------
-    def respond(message, history_msgs, k, temperature, cur_page_size):
-        if not (message and message.strip()):
-            gr.Info("Vui lòng nhập câu hỏi.")
-            return gr.update(), history_msgs, gr.update(), "", "", [], 1, "Trang 0/0"
-
-        # 0) Phân loại: có liên quan pháp lý HN&GĐ 2014?
-        legal = is_legal_query(message)
-        if not legal:
-            # Không tra cứu Qdrant; trả lời ngắn gọn + gợi ý
-            reply = (
-                "Mình chủ yếu hỗ trợ **các vấn đề pháp lý theo Luật Hôn nhân & Gia đình 2014**.\n\n"
-                "Bạn có thể cho mình biết tình huống pháp lý cụ thể (ví dụ: *thủ tục ly hôn, quyền nuôi con, chia tài sản, cấp dưỡng...*)? "
-                "Nếu câu hỏi không thuộc phạm vi này, mình xin phép không tra cứu để tiết kiệm tài nguyên."
-            )
-            upd = history_msgs + [
-                {"role": "user", "content": message},
-                {"role": "assistant", "content": reply},
-            ]
-            # Reset khu cơ sở pháp lý
-            return gr.update(value=""), upd, gr.update(value="(Chưa có dữ liệu)"), reply, "", [], 1, "Trang 0/0"
-
-        # 1) Tìm điều luật (chỉ chạy khi legal=True)
-        try:
-            docs = search_law(message, top_k=int(k))
-        except Exception as e:
-            err = f"Lỗi tìm kiếm Qdrant: {e}"
-            upd = history_msgs + [
-                {"role":"user","content":message},
-                {"role":"assistant","content":err},
-            ]
-            return gr.update(value=""), upd, gr.update(value="(Lỗi tra cứu)"), "", "(Lỗi tra cứu)", [], 1, "Trang 0/0"
-
-        # 2) Render trang 1 cho Cơ sở pháp lý
-        first_page = 1
-        cites_markdown, page_label = docs_page_markdown(docs, first_page, int(cur_page_size))
-
-        # 3) Tạo prompt theo yêu cầu
-        prompt = build_prompt(message, docs, history_msgs)
-
-        # 4) Đẩy user + placeholder assistant (ĐÚNG SCHEMA V5)
-        history_msgs = history_msgs + [
-            {"role": "user", "content": message},
-            {"role": "assistant", "content": ""},   # stream đổ vào đây
-        ]
-
-        # 5) Stream kết quả vào message cuối
-        acc = ""
-        for chunk in stream_answer(prompt, temperature=float(temperature)):
-            acc += chunk
-            history_msgs[-1]["content"] = acc
-            yield (
-                gr.update(value=""),                 # clear ô nhập
-                history_msgs,                        # cập nhật Chatbot
-                gr.update(value=cites_markdown),     # Markdown cơ sở pháp lý (trang 1)
-                acc,                                 # lưu để debug/nội bộ
-                cites_markdown,                      # lưu markdown hiển thị
-                docs,                                # state_docs
-                first_page,                          # state_page
-                page_label                           # page_info
-            )
-
+    # -------- Click/Submit bindings --------
     send.click(
         respond,
-        inputs=[msg, state_history, topk, temp, page_size],
-        outputs=[msg, chatbot, cites_md, state_last_answer, state_last_cites, state_docs, state_page, page_info],
+        inputs=[msg, chatbot, topk, temp, page_size, state_session],
+        outputs=[msg, chatbot, cites_md, state_last_answer, state_last_cites, state_docs, state_page, page_info, state_session],  # Thêm state_session
         queue=True,
     )
     msg.submit(
         respond,
-        inputs=[msg, state_history, topk, temp, page_size],
-        outputs=[msg, chatbot, cites_md, state_last_answer, state_last_cites, state_docs, state_page, page_info],
+        inputs=[msg, chatbot, topk, temp, page_size, state_session],
+        outputs=[msg, chatbot, cites_md, state_last_answer, state_last_cites, state_docs, state_page, page_info, state_session],  # Thêm state_session
         queue=True,
     )
 
-    # -------- Like/Dislike (Gradio 5) --------
+    clear_btn.click(
+        on_clear,
+        inputs=[state_session],
+        outputs=[chatbot, cites_md, state_last_answer, state_last_cites, state_docs, state_page, page_info, state_session],  # Thêm state_session
+        queue=False
+    )
+
+    # -------- Like/Dislike --------
     def on_like(data: gr.LikeData):
         msg_like = data.value or {}
         role = msg_like.get("role", "assistant")
@@ -420,7 +502,6 @@ with gr.Blocks(
         return render_cites_for_page(docs, new_page, cur_page_size)
 
     def on_change_page_size(docs, cur_page_size):
-        # Khi đổi page_size, quay về trang 1
         return render_cites_for_page(docs, 1, cur_page_size)
 
     prev_page.click(
@@ -442,17 +523,6 @@ with gr.Blocks(
         queue=False,
     )
 
-    # -------- Clear --------
-    def on_clear():
-        return [], "(Chưa có dữ liệu)", "", "", [], 1, "Trang 0/0"
-
-    clear.click(
-        on_clear,
-        None,
-        [chatbot, cites_md, state_last_answer, state_last_cites, state_docs, state_page, page_info],
-        queue=False
-    )
-
     # Footer
     gr.HTML(f"""
     <div class="footer">
@@ -461,5 +531,6 @@ with gr.Blocks(
     </div>
     """)
 
+
 if __name__ == "__main__":
-    demo.launch(show_error=True)
+    demo.launch()
