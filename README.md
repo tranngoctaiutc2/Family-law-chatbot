@@ -43,14 +43,17 @@ pip install -r requirements.txt
 Tạo file `.env` trong thư mục gốc với nội dung mẫu:
 
 ```env
-QDRANT_URL=your_qdrant_url
-QDRANT_API_KEY=your_qdrant_api_key
+QDRANT_URL=
+QDRANT_API_KEY=
 
-GEMINI_API_KEY=your_gemini_api_key
-EMBEDDING_MODEL=BAAI/bge-m3 (Hoặc mô hình khác)
-COLLECTION_NAME=your_collection
+GEMINI_API_KEY=
+EMBEDDING_MODEL=BAAI/bge-m3
+COLLECTION_NAME=
 BATCH_SIZE=256
 QDRANT_TIMEOUT=120
+MONGO_URI=
+GEMINI_MODEL_ID=models/gemini-1.5-flash
+
 ```
 
 ---
