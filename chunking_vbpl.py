@@ -2,7 +2,8 @@
 # -*- coding: utf-8 -*-
 
 """
-chunking.py
+chunking_vbpl.py
+"Chunking văn bản pháp luật"
 -----------
 Pass 1 (pre-scan): Đếm CHƯƠNG & ĐIỀU ở đầu dòng.
 Pass 2 (strict): Chương N -> chỉ chấp nhận Chương N+1; Điều k -> chỉ chấp nhận Điều k+1.
@@ -18,7 +19,7 @@ Micro-chunk:
   "Khoản 2, điểm b) Cấm các hành vi sau đây:\nTảo hôn, …"
 
 Chạy:
-python chunking.py --input "luat_hon_nhan_va_gia_dinh.docx" --output "hn2014_chunks.json" --law-no "52/2014/QH13" --law-title "Luật Hôn nhân và Gia đình" --law-id "HN2014"
+python chunking_vbpl.py --input "luat_hon_nhan_va_gia_dinh.docx" --output "hn2014_chunks.json" --law-no "52/2014/QH13" --law-title "Luật Hôn nhân và Gia đình" --law-id "HN2014"
 """
 
 import argparse
@@ -156,10 +157,6 @@ def flush_point(chunks, base, stats, article_no, article_title, clause_no, lette
     content = (content or "").strip()
     if not content:
         return
-    # TIÊM intro khoản vào đầu nội dung điểm (nếu có)
-    if clause_intro:
-        intro = clause_intro.rstrip().rstrip(':') + ':'
-        content = f"{intro}\n{content}"
     letter = letter.lower()
     cid = f"{base['law_id']}-D{article_no}-K{clause_no}-{letter}"
     exact = f"Điều {article_no} khoản {clause_no} điểm {letter})"
@@ -176,7 +173,7 @@ def flush_point(chunks, base, stats, article_no, article_title, clause_no, lette
 
     if clause_intro:
         intro = clause_intro.rstrip().rstrip(':')  # bỏ dấu ':' cuối nếu có
-        full_content = f"{art_hdr} Khoản {clause_no} {intro}, điểm {letter})\n{content}"
+        full_content = f"{art_hdr} Khoản {clause_no} {intro}, điểm {letter}): {content}"
     else:
         full_content = f"{art_hdr} Khoản {clause_no}, điểm {letter}) {content}"
 
