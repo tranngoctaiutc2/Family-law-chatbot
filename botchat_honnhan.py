@@ -37,12 +37,12 @@ def search_law(query: str, top_k: int = 7):
     """
     vec = embedder.encode([query], normalize_embeddings=True)[0].tolist()
     try:
-        results = client.query_points(
+        results = client.search(
             collection_name=COLLECTION_NAME,
-            query=vec,
-            limit=max(1, min(int(top_k), 50)),
+            query_vector=vec,   # normalized
+            limit=20,
             with_payload=True
-        ).points
+        )
     except Exception as e:
         print(f"[ERROR] Qdrant query failed: {e}")
         return []
@@ -52,11 +52,20 @@ def search_law(query: str, top_k: int = 7):
         p = r.payload or {}
         docs.append({
             "citation": p.get("exact_citation", ""),
+            "law_id": p.get("law_id", ""),
+            "law_title": p.get("law_title", ""),
+            "issued_date": p.get("issued_date", ""),
+            "effective_date": p.get("effective_date", ""),
             "chapter": p.get("chapter", ""),
+            "chapter_number": p.get("chapter_number", ""),
+            "chapter_title": p.get("chapter_title", ""),
+            "section": p.get("section", ""),
             "article_no": p.get("article_no", ""),
             "article_title": p.get("article_title", ""),
             "clause_no": p.get("clause_no", ""),
+            "clause_intro": p.get("clause_intro", ""),
             "point_letter": p.get("point_letter", ""),
+            "point_id": p.get("point_id", ""),
             "content": (p.get("content") or "").strip(),
             "score": float(r.score or 0.0),
         })
@@ -112,54 +121,17 @@ def docs_page_markdown(docs, page: int, page_size: int):
     return f"**{page_label}**\n\n{body}", page_label
 
 # ================== CLASSIFY: có liên quan pháp lý? ==================
-def is_legal_query(user_query: str) -> bool:
+def is_legal_query(user_query: str, threshold: float = 0.4, top_k: int = 5) -> bool:
     """
-    Dùng Gemini để phân loại nhanh xem câu hỏi có *liên quan tới pháp lý hôn nhân & gia đình VN 2014* hay không.
-    Trả về True nếu LIÊN QUAN, False nếu không.
+    Phân loại nhanh xem câu hỏi có liên quan Luật HN&GĐ 2014 hay không.
+    Dựa vào score tìm được từ Qdrant.
     """
-    prompt = dedent(f"""
-    Hãy phân loại câu sau có LIÊN QUAN đến tư vấn pháp lý theo Luật Hôn nhân & Gia đình Việt Nam 2014 hay không.
+    docs = search_law(user_query, top_k=top_k)
+    if not docs:
+        return False
+    max_score = max(d["score"] for d in docs)
+    return max_score >= threshold
 
-    YÊU CẦU:
-    - Nếu LIÊN QUAN: trả về đúng một từ "LEGAL".
-    - Nếu KHÔNG LIÊN QUAN (xã giao, chitchat, thời tiết, công nghệ, các luật khác...): trả về đúng một từ "NONLEGAL".
-    - Không thêm lời giải thích.
-
-    CÂU CẦN PHÂN LOẠI:
-    ---
-    {user_query}
-    ---
-    """).strip()
-
-    try:
-        cfg = genai.types.GenerationConfig(temperature=0.0)
-        resp = gemini_model.generate_content(prompt, generation_config=cfg)
-        text = (getattr(resp, "text", None) or "").strip().upper()
-        if "LEGAL" in text and "NON" not in text:
-            return True
-        if text == "NONLEGAL" or "NONLEGAL" in text:
-            return False
-        # Nếu model trả rác, fallback heuristic đơn giản theo từ khóa pháp lý
-        keywords = [
-            "ly hôn", "ly hon", "kết hôn", "ket hon", "hôn nhân", "hon nhan",
-            "con chung", "nuôi con", "cap duong", "cấp dưỡng", "tài sản chung",
-            "chia tài sản", "giành quyền", "giám hộ", "giam ho",
-            "ly thân", "ly than", "điều", "khoản", "điểm", "toà", "tòa", "toà án", "tòa án",
-            "giấy đăng ký kết hôn", "hủy kết hôn", "cấm kết hôn"
-        ]
-        q = user_query.lower()
-        return any(k in q for k in keywords)
-    except Exception:
-        # Lỗi gọi model => dùng heuristic
-        keywords = [
-            "ly hôn", "ly hon", "kết hôn", "ket hon", "hôn nhân", "hon nhan",
-            "con chung", "nuôi con", "cap duong", "cấp dưỡng", "tài sản chung",
-            "chia tài sản", "giành quyền", "giám hộ", "giam ho",
-            "ly thân", "ly than", "điều", "khoản", "điểm", "toà", "tòa", "toà án", "tòa án",
-            "giấy đăng ký kết hôn", "hủy kết hôn", "cấm kết hôn"
-        ]
-        q = user_query.lower()
-        return any(k in q for k in keywords)
 
 # ================== PROMPT ==================
 def build_prompt(query: str, docs, history_msgs, law_name="Luật Hôn nhân và Gia đình 2014"):
@@ -183,25 +155,18 @@ def build_prompt(query: str, docs, history_msgs, law_name="Luật Hôn nhân và
     context = "\n".join(context_lines) if context_lines else "❌ Không có điều luật nào."
 
     prompt = dedent(f"""
-    Bạn là **trợ lý pháp luật** chuyên phân tích và tư vấn theo **{law_name}**. 
-    Vai trò: giải thích luật một cách chính xác nhưng dễ hiểu, giúp người dân nắm rõ quy định và áp dụng trong đời sống. 
-    Không phải chỉ đọc luật, mà cần làm rõ ý nghĩa thực tế.
+    Bạn là **trợ lý pháp luật** dựa trên **{law_name}**. 
+    Nhiệm vụ: giải thích quy định ngắn gọn, dễ hiểu, áp dụng thực tế. 
 
-    Quy tắc bắt buộc:
-    - Chỉ trả lời dựa trên các điều luật được cung cấp bên dưới.
-    - Nếu không tìm thấy quy định phù hợp → trả lời: "Không tìm thấy quy định trong văn bản pháp luật hiện hành."
-    - Không bịa, không đưa ý kiến cá nhân ngoài phạm vi luật.
-    - Độ dài câu trả lời ≤ 350 từ.
-
-    Yêu cầu khi trả lời:
-    - Trích dẫn ngắn gọn Điều/Khoản/Điểm và nguyên văn nội dung liên quan.
-    - Giải thích bằng ngôn ngữ dễ hiểu, gần gũi.
-    - Có thể đưa ví dụ thực tế minh họa (nếu phù hợp).
+    Quy tắc:
+    - Chỉ dùng điều luật trong danh sách bên dưới.
+    - Nếu không có điều phù hợp → trả lời: "Không tìm thấy quy định trong văn bản pháp luật hiện hành."
+    - Không bịa, không đưa ý kiến ngoài luật.
+    - Khi trả lời: cần trích dẫn Điều/Khoản/Điểm, giải thích bằng ngôn ngữ dễ hiểu và có thể minh họa bằng ví dụ thực tế
     - Trình bày theo cấu trúc:
       1) **Tóm tắt câu hỏi/tình huống**
       2) **Cơ sở pháp lý** (trích dẫn ngắn gọn luật từ danh sách bên dưới)
-      3) **Phân tích** ( có ví dụ minh họa nhưng vẫn phải trích dẫn các điều luật)
-      4) **Kết luận** (dựa trên phân tích ở trên, tóm tắt vấn đề bằng ngôn ngữ dễ hiểu, nêu rõ quyền lợi của các bên, hậu quả pháp lý và hướng xử lý thực tế, tránh trích dẫn luật máy móc)
+      4) **Kết luận** (quyền lợi, hậu quả, hướng xử lý thực tế)
 
 
     Câu hỏi hiện tại:
@@ -546,6 +511,7 @@ with gr.Blocks(
       Nội dung chỉ mang tính tham khảo, không thay thế tư vấn pháp lý chính thức.
     </div>
     """)
+
 
 
 if __name__ == "__main__":
