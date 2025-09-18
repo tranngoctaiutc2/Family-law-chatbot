@@ -3,7 +3,8 @@ from google.auth.transport.requests import Request
 import requests
 import json
 
-SERVICE_ACCOUNT_FILE = "D:\Project Python\family_law\Family-law-chatbot\vertex-sa.json"
+SERVICE_ACCOUNT_FILE = r"D:\Project Python\family_law\Family-law-chatbot\vertex-sa.json"
+
 
 # Scope riêng cho Vertex AI / Gemini
 SCOPES = ["https://www.googleapis.com/auth/cloud-platform"]

@@ -1,9 +1,11 @@
 from qdrant_client import QdrantClient
 from sentence_transformers import SentenceTransformer
-
+from dotenv import load_dotenv
+import os
 # ================== Cấu hình ==================
-QDRANT_URL = "https://0b8720b3-9ed5-417b-bdb9-8bc6207ae487.eu-west-2-0.aws.cloud.qdrant.io"
-API_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhY2Nlc3MiOiJtIn0.xia-hOQAAZmHndTFEk4Cct7BsbnKtDaZsEj3usU5f5E"
+load_dotenv()
+QDRANT_URL = os.getenv("QDRANT_URL", "").strip()
+API_KEY = os.getenv("QDRANT_API_KEY", "").strip()
 COLLECTION_NAME = "Family_Law"
 EMBEDDING_MODEL = "BAAI/bge-m3"  # dimension 4096
 
