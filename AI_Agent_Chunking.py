@@ -16,7 +16,7 @@ Flow:
 python AI_Agent_Chunking.py --input "luat_hon_nhan_va_gia_dinh.docx" --output "hn2014_chunks.json" --law-no "52/2014/QH13" --law-title "Luật Hôn nhân và Gia đình" --law-id "HN2014"
 
 # Chunking + gọi Gemini đánh giá (--AI):
-python AI_Agent_Chunking.py --input "data/luat_hon_nhan_va_gia_dinh.docx" --output "hn2014_chunks.json" --AI --law-no "52/2014/QH13" --law-title "Luật Hôn nhân và Gia đình" --law-id "HN2014"
+python AI_Agent_Chunking.py --input "data/luat_hon_nhan_va_gia_dinh.docx" --output "hn2014_chunks.json" --AI --law-no "52/2014/QH13" --law-title "Luật Hôn nhân và Gia đình" --law-id "HN2014" --issued-date "2014-06-19" --effective-date "2014-06-19" --signer "Chủ tịch Quốc hội Nguyễn Sinh Hùng"
 python AI_Agent_Chunking.py --input "data/luat_xay_dung.docx" --output "xd2014_chunks.json" --AI --law-no "50/2014/QH13" --law-title "Luật Xây dựng" --law-id "XD2014"
 python AI_Agent_Chunking.py --input "data/luat_dau_tu.docx" --output "dt2020_chunks.json" --AI --law-no "61/2020/QH14" --law-title "Luật Đầu tư" --law-id "DT2020"
 
@@ -104,19 +104,34 @@ def roman_to_int(s: str) -> Optional[int]:
 def prescan(lines: List[str]) -> Tuple[List[int], List[int], List[str], List[str]]:
     chapters_nums, articles_nums = [], []
     chapters_labels, article_titles_seen = [], []
+    expecting_chapter_title = False
+    roman_current = None
     for raw in lines:
         line = raw
         if not line:
             continue
+        if expecting_chapter_title:
+            if not (CHAPTER_RE.match(line) or CLAUSE_RE.match(line) or POINT_RE.match(line) or ARTICLE_RE.match(line)):
+                ch_title = line.strip()
+                lbl = f"Chương {roman_current} – {ch_title}"
+                chapters_labels[-1] = lbl  # cập nhật label cuối
+                expecting_chapter_title = False
+                continue
+            else:
+                expecting_chapter_title = False
         m_ch = CHAPTER_RE.match(line)
         if m_ch:
             n = roman_to_int(m_ch.group(1))
             if n:
                 chapters_nums.append(n)
                 title = (m_ch.group(2) or "").strip()
-                chapters_labels.append(
-                    f"Chương {m_ch.group(1).strip()}" + (f" – {title}" if title else "")
-                )
+                lbl = f"Chương {m_ch.group(1).strip()}" + (f" – {title}" if title else "")
+                chapters_labels.append(lbl)
+                if not title:
+                    expecting_chapter_title = True
+                    roman_current = m_ch.group(1).strip()
+                else:
+                    expecting_chapter_title = False
             continue
         m_art = ARTICLE_RE.match(line)
         if m_art:
@@ -148,7 +163,7 @@ def is_intro_text_for_clauses(text: str) -> bool:
     return False
 
 # ===== Flush helpers =====
-def flush_article_intro(chunks, base, stats, article_no, article_title, article_intro_buf, chapter, citations):
+def flush_article_intro(chunks, base, stats, article_no, article_title, article_intro_buf, chapter, citations, chapter_number):
     content = (article_intro_buf or "").strip()
     if not content:
         return
@@ -157,7 +172,8 @@ def flush_article_intro(chunks, base, stats, article_no, article_title, article_
     meta = {
         **base, "chapter": chapter,
         "article_no": article_no, "article_title": article_title,
-        "exact_citation": exact
+        "exact_citation": exact,
+        "chapter_number": chapter_number
     }
     title_line = f"Điều {article_no}. {article_title}".strip() if article_title else f"Điều {article_no}"
     chunks.append({"id": cid, "content": f"{title_line}\n{content}", "metadata": meta})
@@ -165,7 +181,7 @@ def flush_article_intro(chunks, base, stats, article_no, article_title, article_
     citations.append(exact)
 
 def flush_clause(chunks, base, stats, article_no, article_title, clause_no, content,
-                 chapter, citations, clause_intro: Optional[str] = None):
+                 chapter, citations, clause_intro: Optional[str] = None, chapter_number=None):
     content = (content or "").strip()
     if not content:
         return
@@ -174,7 +190,8 @@ def flush_clause(chunks, base, stats, article_no, article_title, clause_no, cont
     meta = {
         **base, "chapter": chapter,
         "article_no": article_no, "article_title": article_title,
-        "clause_no": clause_no, "exact_citation": exact
+        "clause_no": clause_no, "exact_citation": exact,
+        "chapter_number": chapter_number
     }
     art_hdr = build_article_header(article_no, article_title)
 
@@ -190,7 +207,7 @@ def flush_clause(chunks, base, stats, article_no, article_title, clause_no, cont
     stats["clauses"] += 1
     citations.append(exact)
 
-def flush_point(chunks, base, stats, article_no, article_title, clause_no, letter, content, chapter, citations, clause_intro: Optional[str] = None):
+def flush_point(chunks, base, stats, article_no, article_title, clause_no, letter, content, chapter, citations, clause_intro: Optional[str] = None, chapter_number=None):
     content = (content or "").strip()
     if not content:
         return
@@ -204,7 +221,8 @@ def flush_point(chunks, base, stats, article_no, article_title, clause_no, lette
         **base, "chapter": chapter,
         "article_no": article_no, "article_title": article_title,
         "clause_no": clause_no, "point_letter": letter,
-        "exact_citation": exact
+        "exact_citation": exact,
+        "chapter_number": chapter_number
     }
     if clause_intro:
         meta["clause_intro"] = clause_intro
@@ -229,6 +247,9 @@ def chunk_strict(lines: List[str], base: Dict, chapters_set: set, articles_set: 
     halted_reason: Optional[str] = None
 
     chapter_label: Optional[str] = None
+    expecting_chapter_title: bool = False
+    roman_current: Optional[str] = None
+    chapter_number: Optional[int] = None
 
     article_no: Optional[int] = None
     article_title: str = ""
@@ -258,10 +279,10 @@ def chunk_strict(lines: List[str], base: Dict, chapters_set: set, articles_set: 
             return
         if in_points and point_letter:
             flush_point(chunks, base, stats, article_no, article_title, clause_no, point_letter,
-                        point_buf, chapter_label, citations, clause_intro_current)
+                        point_buf, chapter_label, citations, clause_intro_current, chapter_number)
         elif clause_buf.strip():
             flush_clause(chunks, base, stats, article_no, article_title, clause_no, clause_buf,
-                         chapter_label, citations, article_clause_intro_current)
+                         chapter_label, citations, article_clause_intro_current, chapter_number)
         article_has_any_chunk = True
         clause_no, clause_buf, in_points, point_letter, point_buf = None, "", False, None, ""
         clause_intro_current = None
@@ -270,7 +291,7 @@ def chunk_strict(lines: List[str], base: Dict, chapters_set: set, articles_set: 
         nonlocal article_intro_buf, article_has_any_chunk
         if (not article_has_any_chunk) and article_intro_buf.strip():
             flush_article_intro(chunks, base, stats, article_no, article_title, article_intro_buf,
-                                chapter_label, citations)
+                                chapter_label, citations, chapter_number)
         article_intro_buf = ""
         article_has_any_chunk = False
 
@@ -317,6 +338,19 @@ def chunk_strict(lines: List[str], base: Dict, chapters_set: set, articles_set: 
             else:
                 expecting_article_title = False
 
+        if expecting_chapter_title:
+            if not (CHAPTER_RE.match(line) or CLAUSE_RE.match(line) or POINT_RE.match(line) or ARTICLE_RE.match(line)):
+                ch_title = line.strip()
+                lbl = f"Chương {roman_current} – {ch_title}"
+                chapter_label = lbl
+                if lbl not in chapters_seen_labels:
+                    chapters_seen_labels.append(lbl)
+                base["chapter"] = chapter_label
+                expecting_chapter_title = False
+                continue
+            else:
+                expecting_chapter_title = False
+
         # CHƯƠNG
         m_ch = CHAPTER_RE.match(line)
         if m_ch:
@@ -334,6 +368,18 @@ def chunk_strict(lines: List[str], base: Dict, chapters_set: set, articles_set: 
             ch_title = (m_ch.group(2) or "").strip()
             lbl = f"Chương {roman}" + (f" – {ch_title}" if ch_title else "")
 
+            if not ch_title:
+                expecting_chapter_title = True
+                roman_current = roman  # lưu lại để dùng sau
+                chapter_number = ch_num  # lưu chapter_number
+            else:
+                chapter_label = lbl
+                chapter_number = ch_num  # lưu chapter_number
+                if lbl not in chapters_seen_labels:
+                    chapters_seen_labels.append(lbl)
+                base["chapter"] = chapter_label
+                expecting_chapter_title = False
+
             if expected_chapter is None:
                 expected_chapter = ch_num + 1
             else:
@@ -350,10 +396,6 @@ def chunk_strict(lines: List[str], base: Dict, chapters_set: set, articles_set: 
                     warnings.append(f"Bỏ qua {lbl} (Chương lùi số).")
                     continue
 
-            chapter_label = lbl
-            if lbl not in chapters_seen_labels:
-                chapters_seen_labels.append(lbl)
-            base["chapter"] = chapter_label
             continue
 
         # ĐIỀU
@@ -628,6 +670,9 @@ def main():
     ap.add_argument("--law-no", default="52/2014/QH13")
     ap.add_argument("--law-title", default="Luật Hôn nhân và Gia đình")
     ap.add_argument("--law-id", default="LAW")
+    ap.add_argument("--issued-date", help="Ngày ban hành luật (YYYY-MM-DD)")
+    ap.add_argument("--effective-date", help="Ngày có hiệu lực (YYYY-MM-DD)")
+    ap.add_argument("--signer", help="Người ký luật")
 
     # Chỉ bật AI khi có cờ --AI
     ap.add_argument("--AI", action="store_true", help="BẬT gọi Gemini (mặc định KHÔNG gọi).")
@@ -659,7 +704,15 @@ def main():
     print(f"Tổng ĐIỀU   (đầu dòng): {len(articles_nums)}")
 
     # PASS 2 (chunk strict)
-    base = {"law_no": args.law_no, "law_title": args.law_title, "law_id": args.law_id}
+    base = {
+        "law_no": args.law_no,
+        "law_title": args.law_title,
+        "law_id": args.law_id,
+        "issued_date": args.issued_date,
+        "effective_date": args.effective_date,
+        "expiry_date": None,  # mặc định null
+        "signer": args.signer
+    }
     chunks, summary = chunk_strict(lines, base, chapters_set, articles_set)
 
     # In tóm tắt
