@@ -70,11 +70,11 @@ if not metrics_logger.handlers:
     metrics_logger.addHandler(fh)
     metrics_logger.setLevel(logging.INFO)
 
-
+#Ghi metrics/log các bước xử lý
 def log_step(event: str, **kv):
     kvpairs = ",".join([f"{k}={v}" for k, v in kv.items()])
     metrics_logger.info(f"ts={int(time.time())},evt={event},{kvpairs}")
-
+#Decorator đo thời gian chạy của hàm và log.
 def log_time(func):
     import functools
     @functools.wraps(func)
@@ -95,7 +95,7 @@ embedder = SentenceTransformer(EMBEDDING_MODEL)
 genai.configure()
 INTENT_SYSTEM_PROMPT = dedent("""
 Bạn là trợ lý về Luật HN&GĐ VN.
-Hãy trả về **JSON THUẦN** (không markdown, không lời dẫn).
+Trả về **JSON thuần** (không markdown, không lời dẫn).
 
 Schema một trong các dạng:
 1) {"intent":"casual","answer":"..."}
@@ -103,10 +103,10 @@ Schema một trong các dạng:
 3) {"intent":"law_search","filters":{"article_no":int?,"clause_no":int?,"point_letter":str?,"chapter_number":int?}}
 
 Quy tắc xác định intent:
-- Câu hỏi nhắm tới nội dung điều/khoản/chương/mục cụ thể → law_search.
-- Xã giao/chào hỏi → casual.
+- Hỏi về điều/khoản/chương/mục cụ thể → law_search.
+- Hỏi xã giao/chào hỏi → casual.
 - Nhắc số điều/khoản nhưng hỏi tình huống thực tế, áp dụng, thủ tục → legal_answer.
-- Luôn dựa vào **mục đích câu hỏi**, không chỉ số điều/khoản.
+- Luôn dựa vào **mục đích câu hỏi**, không chỉ dựa vào số điều/khoản.
 
 Nếu intent = casual thì bắt buộc có answer (tiếng Việt, lịch sự).
 """)
@@ -118,6 +118,7 @@ answer_model = genai.GenerativeModel(
     model_name=GEMINI_MODEL_ID,
 )
 # ================== HELPERS ==================
+#Cắt chuỗi dài quá limit.
 def _safe_truncate(text: str, limit: int = 800) -> str:
     return text if text and len(text) <= limit else (text[:limit] + "…(cắt)") if text else ""
 
@@ -125,10 +126,10 @@ LEGAL_HINTS = re.compile(
     r"(?i)\b(điều|khoản|điểm|chương|hôn nhân|ly hôn|ly thân|nuôi con|tài sản|"
     r"quan hệ vợ chồng|kết hôn|hủy kết hôn|chung sống như vợ chồng|cấp dưỡng|giám hộ)\b"
 )
-
+#Kiểm tra xem câu hỏi có liên quan luật không.
 def looks_like_legal(query: str) -> bool:
     return bool(LEGAL_HINTS.search(query or ""))
-
+#Cache đơn giản với TTL (dùng cho embedding, search).
 class SimpleTTLCache:
     def __init__(self, ttl_seconds: int = 1800, max_items: int = 512):
         self.ttl = ttl_seconds
@@ -158,7 +159,7 @@ class SimpleTTLCache:
 embed_cache = SimpleTTLCache(ttl_seconds=3600, max_items=1024)
 search_cache = SimpleTTLCache(ttl_seconds=900, max_items=1024)
 
-
+#Chuyển câu hỏi thành embedding vector, cache kết quả
 def encode_query(text: str):
     key = f"{EMBEDDING_MODEL}|query|{text}"
     v = embed_cache.get(key)
@@ -170,6 +171,7 @@ def encode_query(text: str):
 
 
 # ================== INTENT (xử lý và phân loại câu hỏi) ==================
+#Gọi Gemini AI để phân loại intent
 @log_time
 def _intent_via_gemini(query: str) -> Dict[str, Any]:#AI phân loại intent.
     try:
@@ -274,7 +276,7 @@ def analyze_intent(query: str) -> Dict[str, Any]:#bộ lọc + fallback thủ c�
 
 
 # ================== HIBRID SEARCH ==================
-
+#Tạo filter Qdrant từ điều/khoản/điểm/chương
 @log_time
 def _build_filter(query_text: str) -> Optional[Filter]:
     conds: List[FieldCondition] = []
@@ -292,6 +294,7 @@ def _build_filter(query_text: str) -> Optional[Filter]:
         conds.append(FieldCondition(key="chapter_number", match=MatchValue(value=int(m.group(1)))))
     return Filter(must=conds) if conds else None
 
+#Tìm văn bản luật dựa trên embedding + filter
 @log_time
 def search_law(query: str, top_k: int = 15, score_threshold: float = 0.42):
     t0 = time.perf_counter()
@@ -360,7 +363,7 @@ def search_law(query: str, top_k: int = 15, score_threshold: float = 0.42):
         raise
 
 # ================== RENDER UTILS ==================
-
+#Tạo chuỗi trích dẫn điều/khoản/điểm từ document
 def law_line(d: Dict[str, Any]) -> Tuple[str, str, str]:
     art = d.get("article_no"); cls = d.get("clause_no"); pt  = d.get("point_letter")
     parts = []
@@ -372,7 +375,7 @@ def law_line(d: Dict[str, Any]) -> Tuple[str, str, str]:
     title = f" — {d.get('article_title')}" if d.get("article_title") else ""
     return cited, chapter, title
 
-
+#Chuyển danh sách document thành Markdown
 def docs_to_markdown(docs: List[Dict[str, Any]]):
     if not docs:
         return "❌ Không tìm thấy điều luật nào."
@@ -387,7 +390,7 @@ def docs_to_markdown(docs: List[Dict[str, Any]]):
             f"<sub>Độ liên quan: {score}</sub>\n"
         )
     return "\n".join(lines)
-
+#Lấy slice dữ liệu theo trang
 def paginate_docs(docs, page: int, page_size: int):
     total = len(docs)
     if total == 0:
@@ -399,7 +402,7 @@ def paginate_docs(docs, page: int, page_size: int):
     sliced = docs[start:end]
     total_pages = (total + page_size - 1) // page_size
     return sliced, total, total_pages, start
-
+#Tạo Markdown cho trang cụ thể.
 def docs_page_markdown(docs, page: int, page_size: int):
     sliced, total, total_pages, start = paginate_docs(docs, page, page_size)
     if total == 0:
@@ -410,6 +413,7 @@ def docs_page_markdown(docs, page: int, page_size: int):
 
 
 # ================== PROMPT ==================
+#Tạo prompt cho LLM với context luật và lịch sử
 @log_time
 def build_prompt(query: str, docs: List[Dict[str, Any]], history_msgs=None, ):
     
@@ -448,16 +452,16 @@ def build_prompt(query: str, docs: List[Dict[str, Any]], history_msgs=None, ):
     context = "\n".join(context_lines) if context_lines else "❌ Không có điều luật nào."
 
     prompt = dedent(f"""
-    Bạn là luật sư tư vấn về Luật Hôn nhân & Gia Đình. Chỉ dùng các trích đoạn trong danh sách dưới đây 
+    Bạn là luật sư tư vấn Luật Hôn nhân & Gia Đình, chỉ dùng trích đoạn trong danh sách sau. 
     Quy tắc:
-    - Nếu câu hỏi là nhận định Đúng/Sai → trả lời **Kết luận: Đúng/Sai** + lý do.
-    - Nếu câu hỏi thường → trả lời **ngắn gọn 1–3 câu**, bám sát câu hỏi.
-    - **Trích dẫn nguyên văn** các điều luật liên quan trong danh sách (không bỏ sót), theo thứ tự: Điểm – Khoản – Điều + nội dung.
-    - Nếu thiếu căn cứ, trả lời: **“Không đủ căn cứ.”**
-    - Nếu câu hỏi không liên quan đến luật → trả lời lịch sự, ngắn gọn, không viện dẫn luật.
+    - Câu hỏi Đúng/Sai → trả lời **Kết luận: Đúng/Sai** + lý do.
+    - Câu hỏi thường → trả lời **1–3 câu**, bám sát câu hỏi.
+    - **Trích dẫn nguyên văn** điều luật liên quan (Điểm–Khoản–Điều + nội dung), theo thứ tự.
+    - Nếu thiếu căn cứ → trả lời: **Không đủ căn cứ.**
+    - Câu hỏi ngoài luật → trả lời lịch sự, ngắn gọn, không viện dẫn luật.
     ĐỊNH DẠNG TRẢ LỜI:
-    - Trích dẫn: <liệt kê toàn bộ Điểm–Khoản–Điều + nội dung nguyên văn>
-    - Giải thích: <1–3 câu, áp dụng vào tình huống>
+    - Trích dẫn: <liệt kê toàn bộ Điểm–Khoản–Điều + nội dung>
+    - Giải thích: <1–3 câu, áp dụng tình huống>
     - Kết luận: <kết luận ngắn gọn dựa vào câu hỏi và giải thích>
 
 
@@ -471,12 +475,12 @@ def build_prompt(query: str, docs: List[Dict[str, Any]], history_msgs=None, ):
     return prompt
 
 # ================== LLM STREAM ==================
-
+#Gọi Gemini AI để stream trả lời.
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
 def _gemini_stream(prompt, temperature: float):
     cfg = genai.types.GenerationConfig(temperature=float(temperature))
     return answer_model.generate_content(prompt, generation_config=cfg, stream=True)
-
+#Stream trả lời LLM ra UI
 @log_time
 def stream_answer(prompt, temperature=0.2):
     t0 = time.perf_counter(); t_first0 = time.perf_counter(); first_token_emitted = False
@@ -495,6 +499,7 @@ def stream_answer(prompt, temperature=0.2):
         log_step("llm_tong", t=f"{time.perf_counter()-t0:.4f}")
 
 # -------- Qdrant Fetch Helper --------
+#Lấy document từ Qdrant dựa trên filters.
 @log_time
 def _fetch(filters: Dict[str, Any], limit: int = 10):
     must = []
@@ -617,6 +622,7 @@ with gr.Blocks(
     state_page = gr.State(1)
 
     # Helper để đảm bảo đúng thứ tự/đủ outputs
+    #Chuẩn hóa output cho Gradio UI.
     def ui_return(msg_val, chatbot_val, cites_val, last_answer_val, docs_val, page_val, page_label_val, history_val):
         return (
             msg_val, chatbot_val, gr.update(value=cites_val), last_answer_val,
@@ -625,6 +631,7 @@ with gr.Blocks(
 
     
         # -------- Core Handler (Streaming) --------
+    #Xử lý input từ người dùng, phân loại intent, tìm luật, tạo prompt, stream trả lời.
     @log_time   
     def respond(message, history_msgs, cur_page_size, k=15 , temperature=0.2, threshold=0.42):
         if not (message and message.strip()):
