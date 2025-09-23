@@ -75,7 +75,17 @@ def log_step(event: str, **kv):
     kvpairs = ",".join([f"{k}={v}" for k, v in kv.items()])
     metrics_logger.info(f"ts={int(time.time())},evt={event},{kvpairs}")
 
-
+def log_time(func):
+    import functools
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        t0 = time.perf_counter()
+        try:
+            return func(*args, **kwargs)
+        finally:
+            elapsed = time.perf_counter() - t0
+            app_log.info(f"{func.__name__}_TIME", extra={"__kv__": {"elapsed_sec": f"{elapsed:.4f}"}})
+    return wrapper
 
 
 # ================== INIT ==================
@@ -160,7 +170,7 @@ def encode_query(text: str):
 
 
 # ================== INTENT (xử lý và phân loại câu hỏi) ==================
-
+@log_time
 def _intent_via_gemini(query: str) -> Dict[str, Any]:#AI phân loại intent.
     try:
         cfg = genai.types.GenerationConfig(
@@ -240,7 +250,7 @@ def _intent_via_gemini(query: str) -> Dict[str, Any]:#AI phân loại intent.
         # Fallback cuối cùng khi exception bất thường
         return {"intent": "casual", "answer": INTENT_FALLBACK_CASUAL}
 
-
+@log_time
 def analyze_intent(query: str) -> Dict[str, Any]:#bộ lọc + fallback thủ công để chắc chắn lúc nào cũng có intent hợp lệ.
     data = _intent_via_gemini(query)
     intent = data.get("intent")
@@ -265,7 +275,7 @@ def analyze_intent(query: str) -> Dict[str, Any]:#bộ lọc + fallback thủ c�
 
 # ================== HIBRID SEARCH ==================
 
-
+@log_time
 def _build_filter(query_text: str) -> Optional[Filter]:
     conds: List[FieldCondition] = []
     m = re.search(r"(?i)\bđiều\s*(\d+)\b", query_text)
@@ -282,7 +292,7 @@ def _build_filter(query_text: str) -> Optional[Filter]:
         conds.append(FieldCondition(key="chapter_number", match=MatchValue(value=int(m.group(1)))))
     return Filter(must=conds) if conds else None
 
-
+@log_time
 def search_law(query: str, top_k: int = 15, score_threshold: float = 0.42):
     t0 = time.perf_counter()
     app_log.info("SEARCH_BEGIN", extra={"__kv__": {"q": _safe_truncate(query, 80), "k": top_k, "thr": score_threshold}})
@@ -400,6 +410,7 @@ def docs_page_markdown(docs, page: int, page_size: int):
 
 
 # ================== PROMPT ==================
+@log_time
 def build_prompt(query: str, docs: List[Dict[str, Any]], history_msgs=None, ):
     
     history_block = ""
@@ -466,7 +477,7 @@ def _gemini_stream(prompt, temperature: float):
     cfg = genai.types.GenerationConfig(temperature=float(temperature))
     return answer_model.generate_content(prompt, generation_config=cfg, stream=True)
 
-
+@log_time
 def stream_answer(prompt, temperature=0.2):
     t0 = time.perf_counter(); t_first0 = time.perf_counter(); first_token_emitted = False
     try:
@@ -484,6 +495,7 @@ def stream_answer(prompt, temperature=0.2):
         log_step("llm_tong", t=f"{time.perf_counter()-t0:.4f}")
 
 # -------- Qdrant Fetch Helper --------
+@log_time
 def _fetch(filters: Dict[str, Any], limit: int = 10):
     must = []
     mapping = {"article_no": int, "clause_no": int, "point_letter": str, "chapter_number": int}
@@ -613,6 +625,7 @@ with gr.Blocks(
 
     
         # -------- Core Handler (Streaming) --------
+    @log_time   
     def respond(message, history_msgs, cur_page_size, k=15 , temperature=0.2, threshold=0.42):
         if not (message and message.strip()):
             gr.Info("Vui lòng nhập câu hỏi.")
