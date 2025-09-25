@@ -7,6 +7,8 @@ import time
 import re
 import json
 from typing import List, Dict, Any, Optional, Tuple
+from rank_bm25 import BM25Okapi
+import re
 
 import gradio as gr
 from dotenv import load_dotenv
@@ -274,6 +276,47 @@ def analyze_intent(query: str) -> Dict[str, Any]:  # Đổi từ async def thàn
     log_step("intent", loai=intent, co_legal=str(looks_like_legal(query)))
     app_log.info("INTENT_DECISION", extra={"__kv__": {"intent": intent}})
     return {"intent": intent, "answer": answer, "normalized_query": normalized_query, "original_query": original_query, "filters": filters}
+
+# ================== BM25 ==================
+def tokenize(text):
+    # Simple tokenizer: lowercase + split non-word chars
+    return re.findall(r'\w+', text.lower())
+
+def rank_by_bm25(docs: list, query: str):
+    corpus = [tokenize(d['content']) for d in docs]
+    bm25 = BM25Okapi(corpus)
+    tokenized_query = tokenize(query)
+    scores = bm25.get_scores(tokenized_query)
+    # Gắn score BM25 cho mỗi doc
+    for d, s in zip(docs, scores):
+        d['bm25_score'] = float(s)
+    # Sắp xếp giảm dần theo bm25_score
+    ranked_docs = sorted(docs, key=lambda x: x['bm25_score'], reverse=True)
+    return ranked_docs
+def rerank_bm25(query: str, docs: list) -> list:
+    # Lấy nội dung các chunk
+    corpus = [d.get("content", "") for d in docs]
+    if not corpus:
+        return docs
+
+    # Tạo BM25 model
+    bm25 = BM25Okapi([doc.split() for doc in corpus])
+    scores = bm25.get_scores(query.split())
+
+    # Gắn score BM25 vào docs
+    for d, s in zip(docs, scores):
+        d["bm25_score"] = float(s)
+
+    # Sắp xếp docs theo BM25 score giảm dần
+    reranked = sorted(docs, key=lambda x: x["bm25_score"], reverse=True)
+
+    # Debug log
+    print("DEBUG: BM25 re-ranking results:")
+    for i, d in enumerate(reranked, 1):
+        print(f"  {i}. bm25_score={d['bm25_score']:.4f}, original_score={d.get('score',0.0):.4f}, content_preview={d['content'][:50]}...")
+
+    return reranked
+
 # ================== HIBRID SEARCH ==================
 @log_time
 def _build_filter(query_text: str) -> Optional[Filter]:
@@ -311,9 +354,9 @@ def search_law(query: str, top_k: int = 15, score_threshold: float = 0.42):
         flt = _build_filter(query)
 
         t_q0 = time.perf_counter()
-        results = client.search(
+        results = client.query_points(
             collection_name=COLLECTION_NAME,
-            query_vector=vec,
+            query=vec,
             with_payload=True,
             limit=max(1, min(int(top_k) * 3, 80)),
             query_filter=flt
@@ -321,7 +364,7 @@ def search_law(query: str, top_k: int = 15, score_threshold: float = 0.42):
         t_qdrant = time.perf_counter() - t_q0
 
         raw_docs = []
-        for r in results:
+        for r in results.points:
             p = r.payload or {}
             raw_docs.append({
                 "citation": p.get("exact_citation", ""),
@@ -336,9 +379,13 @@ def search_law(query: str, top_k: int = 15, score_threshold: float = 0.42):
 
         t_filter0 = time.perf_counter()
         filtered = [d for d in raw_docs if d.get("score", 0.0) >= score_threshold] or raw_docs[:max(1, top_k)]
+        # ================= kiểm tra Re-rank BM25 =================
+        filtered = rerank_bm25(query, filtered)
         t_filter = time.perf_counter() - t_filter0
 
         selected = filtered[:top_k]
+        selected = rank_by_bm25(selected, query)[:top_k]
+
         search_cache.set(cache_key, selected)
 
         sk_top1 = selected[0]['score'] if selected else 0.0
@@ -684,6 +731,11 @@ with gr.Blocks(
                 print("DEBUG: Fetching law_search docs")
                 docs = _fetch(intent_filters, limit=int(k)) if intent_filters else []
                 source = "law_search"
+                 #  Nếu không có chỉ số(mục, khoản chương), fallback sang embedding search
+                if not docs:
+                    app_log.info("LAW_SEARCH_FALLBACK", extra={"__kv__": {"query": message}})
+                    docs = search_law(message, top_k=int(k), score_threshold=float(threshold))
+                    source = "law_search_embedding_fallback"
 
             elif intent == "legal_answer":
                 print("DEBUG: Searching legal_answer docs")
