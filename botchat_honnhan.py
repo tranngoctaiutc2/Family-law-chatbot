@@ -1,7 +1,7 @@
+import asyncio
 import os
 from datetime import datetime
 from textwrap import dedent
-
 import logging
 import time
 import re
@@ -19,25 +19,25 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 # ================== ENV ==================
 load_dotenv()
 QDRANT_URL = os.getenv("QDRANT_URL", "").strip()
-QDRANT_API_KEY =  os.getenv("QDRANT_API_KEY", "").strip()
+QDRANT_API_KEY = os.getenv("QDRANT_API_KEY", "").strip()
 COLLECTION_NAME = os.getenv("COLLECTION_NAME", "")
-EMBEDDING_MODEL =  os.getenv("EMBEDDING_MODEL", "BAAI/bge-m3")
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "BAAI/bge-m3")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GEMINI_MODEL_ID = os.getenv("GEMINI_MODEL_ID", "models/gemini-1.5-flash")
 
 INTENT_DEBUG = os.getenv("INTENT_DEBUG", "0").strip() in {"1", "true", "TRUE", "yes", "on"}
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-CASUAL_MAX_WORDS = int(os.getenv("CASUAL_MAX_WORDS", "0").strip() or 0)  # 0 = không giới hạn
-INTENT_RAW_PREVIEW_LIMIT = int(os.getenv("INTENT_RAW_PREVIEW_LIMIT", "240").strip() or 240) #log ngắn gọn hơn
+CASUAL_MAX_WORDS = int(os.getenv("CASUAL_MAX_WORDS", "0").strip() or 0)
+INTENT_RAW_PREVIEW_LIMIT = int(os.getenv("INTENT_RAW_PREVIEW_LIMIT", "240").strip() or 240)
 INTENT_FALLBACK_CASUAL = os.getenv(
     "INTENT_FALLBACK_CASUAL",
-    "Chào bạn, mình có thể hỗ trợ câu hỏi về Luật Hôn nhân & Gia đình. Bạn muốn hỏi nội dung gì?",# câu hỏi mặc định khi 0 hiểu input
+    "Chào bạn, mình có thể hỗ trợ câu hỏi về Luật Hôn nhân & Gia đình. Bạn muốn hỏi nội dung gì?",
 ).strip()
 
 if not (QDRANT_URL and QDRANT_API_KEY):
     raise RuntimeError("Thiếu QDRANT_URL / QDRANT_API_KEY trong .env")
 
-# ================== LOGGING (rõ ràng) ==================
+# ================== LOGGING ==================
 class KVFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         base = super().format(record)
@@ -70,23 +70,29 @@ if not metrics_logger.handlers:
     metrics_logger.addHandler(fh)
     metrics_logger.setLevel(logging.INFO)
 
-#Ghi metrics/log các bước xử lý
 def log_step(event: str, **kv):
     kvpairs = ",".join([f"{k}={v}" for k, v in kv.items()])
     metrics_logger.info(f"ts={int(time.time())},evt={event},{kvpairs}")
-#Decorator đo thời gian chạy của hàm và log.
+
 def log_time(func):
     import functools
     @functools.wraps(func)
-    def wrapper(*args, **kwargs):
+    async def async_wrapper(*args, **kwargs):
+        t0 = time.perf_counter()
+        try:
+            return await func(*args, **kwargs)
+        finally:
+            elapsed = time.perf_counter() - t0
+            app_log.info(f"{func.__name__}_TIME", extra={"__kv__": {"elapsed_sec": f"{elapsed:.4f}"}})
+    @functools.wraps(func)
+    def sync_wrapper(*args, **kwargs):
         t0 = time.perf_counter()
         try:
             return func(*args, **kwargs)
         finally:
             elapsed = time.perf_counter() - t0
             app_log.info(f"{func.__name__}_TIME", extra={"__kv__": {"elapsed_sec": f"{elapsed:.4f}"}})
-    return wrapper
-
+    return async_wrapper if asyncio.iscoroutinefunction(func) else sync_wrapper
 
 # ================== INIT ==================
 client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, prefer_grpc=True)
@@ -117,8 +123,8 @@ gemini_model = genai.GenerativeModel(
 answer_model = genai.GenerativeModel(
     model_name=GEMINI_MODEL_ID,
 )
+
 # ================== HELPERS ==================
-#Cắt chuỗi dài quá limit.
 def _safe_truncate(text: str, limit: int = 800) -> str:
     return text if text and len(text) <= limit else (text[:limit] + "…(cắt)") if text else ""
 
@@ -126,10 +132,10 @@ LEGAL_HINTS = re.compile(
     r"(?i)\b(điều|khoản|điểm|chương|hôn nhân|ly hôn|ly thân|nuôi con|tài sản|"
     r"quan hệ vợ chồng|kết hôn|hủy kết hôn|chung sống như vợ chồng|cấp dưỡng|giám hộ)\b"
 )
-#Kiểm tra xem câu hỏi có liên quan luật không.
+
 def looks_like_legal(query: str) -> bool:
     return bool(LEGAL_HINTS.search(query or ""))
-#Cache đơn giản với TTL (dùng cho embedding, search).
+
 class SimpleTTLCache:
     def __init__(self, ttl_seconds: int = 1800, max_items: int = 512):
         self.ttl = ttl_seconds
@@ -159,7 +165,6 @@ class SimpleTTLCache:
 embed_cache = SimpleTTLCache(ttl_seconds=3600, max_items=1024)
 search_cache = SimpleTTLCache(ttl_seconds=900, max_items=1024)
 
-#Chuyển câu hỏi thành embedding vector, cache kết quả
 def encode_query(text: str):
     key = f"{EMBEDDING_MODEL}|query|{text}"
     v = embed_cache.get(key)
@@ -169,17 +174,16 @@ def encode_query(text: str):
     embed_cache.set(key, vec)
     return vec
 
-
-# ================== INTENT (xử lý và phân loại câu hỏi) ==================
-#Gọi Gemini AI để phân loại intent
+# ================== INTENT ==================
 @log_time
-def _intent_via_gemini(query: str) -> Dict[str, Any]:#AI phân loại intent.
+def _intent_via_gemini(query: str) -> Dict[str, Any]:  # Đổi từ async def thành def (không async)
     try:
         cfg = genai.types.GenerationConfig(
             temperature=0.0,
             max_output_tokens=192,
             response_mime_type="application/json",
         )
+        # Bỏ await, gọi đồng bộ
         resp = gemini_model.generate_content(
             [
                 {
@@ -190,7 +194,6 @@ def _intent_via_gemini(query: str) -> Dict[str, Any]:#AI phân loại intent.
             generation_config=cfg,
         )
 
-        # Thu thập thông tin chi tiết về candidates / finish_reason / safety
         candidates = getattr(resp, "candidates", None) or []
         first_cand = candidates[0] if candidates else None
         finish_reason = getattr(first_cand, "finish_reason", None)
@@ -218,7 +221,6 @@ def _intent_via_gemini(query: str) -> Dict[str, Any]:#AI phân loại intent.
             },
         )
 
-        # Nếu bị block (finish_reason == 2) hoặc không có text => fallback casual trực tiếp
         if finish_reason == 2 or not raw:
             log_step("intent_block", reason=str(finish_reason))
             app_log.warning(
@@ -249,12 +251,11 @@ def _intent_via_gemini(query: str) -> Dict[str, Any]:#AI phân loại intent.
         return out
     except Exception as e:
         app_log.warning("INTENT_ERR", extra={"__kv__": {"err": str(e)}})
-        # Fallback cuối cùng khi exception bất thường
         return {"intent": "casual", "answer": INTENT_FALLBACK_CASUAL}
 
 @log_time
-def analyze_intent(query: str) -> Dict[str, Any]:#bộ lọc + fallback thủ công để chắc chắn lúc nào cũng có intent hợp lệ.
-    data = _intent_via_gemini(query)
+def analyze_intent(query: str) -> Dict[str, Any]:  # Đổi từ async def thành def
+    data = _intent_via_gemini(query)  # Bỏ await
     intent = data.get("intent")
     answer = data.get("answer", "")
     normalized_query = data.get("normalized_query", "") or query
@@ -273,10 +274,7 @@ def analyze_intent(query: str) -> Dict[str, Any]:#bộ lọc + fallback thủ c�
     log_step("intent", loai=intent, co_legal=str(looks_like_legal(query)))
     app_log.info("INTENT_DECISION", extra={"__kv__": {"intent": intent}})
     return {"intent": intent, "answer": answer, "normalized_query": normalized_query, "original_query": original_query, "filters": filters}
-
-
 # ================== HIBRID SEARCH ==================
-#Tạo filter Qdrant từ điều/khoản/điểm/chương
 @log_time
 def _build_filter(query_text: str) -> Optional[Filter]:
     conds: List[FieldCondition] = []
@@ -294,7 +292,6 @@ def _build_filter(query_text: str) -> Optional[Filter]:
         conds.append(FieldCondition(key="chapter_number", match=MatchValue(value=int(m.group(1)))))
     return Filter(must=conds) if conds else None
 
-#Tìm văn bản luật dựa trên embedding + filter
 @log_time
 def search_law(query: str, top_k: int = 15, score_threshold: float = 0.42):
     t0 = time.perf_counter()
@@ -363,9 +360,8 @@ def search_law(query: str, top_k: int = 15, score_threshold: float = 0.42):
         raise
 
 # ================== RENDER UTILS ==================
-#Tạo chuỗi trích dẫn điều/khoản/điểm từ document
 def law_line(d: Dict[str, Any]) -> Tuple[str, str, str]:
-    art = d.get("article_no"); cls = d.get("clause_no"); pt  = d.get("point_letter")
+    art = d.get("article_no"); cls = d.get("clause_no"); pt = d.get("point_letter")
     parts = []
     if pt: parts.append(f"Điểm {pt}")
     if cls: parts.append(f"khoản {cls}")
@@ -375,7 +371,6 @@ def law_line(d: Dict[str, Any]) -> Tuple[str, str, str]:
     title = f" — {d.get('article_title')}" if d.get("article_title") else ""
     return cited, chapter, title
 
-#Chuyển danh sách document thành Markdown
 def docs_to_markdown(docs: List[Dict[str, Any]]):
     if not docs:
         return "❌ Không tìm thấy điều luật nào."
@@ -390,7 +385,7 @@ def docs_to_markdown(docs: List[Dict[str, Any]]):
             f"<sub>Độ liên quan: {score}</sub>\n"
         )
     return "\n".join(lines)
-#Lấy slice dữ liệu theo trang
+
 def paginate_docs(docs, page: int, page_size: int):
     total = len(docs)
     if total == 0:
@@ -402,7 +397,7 @@ def paginate_docs(docs, page: int, page_size: int):
     sliced = docs[start:end]
     total_pages = (total + page_size - 1) // page_size
     return sliced, total, total_pages, start
-#Tạo Markdown cho trang cụ thể.
+
 def docs_page_markdown(docs, page: int, page_size: int):
     sliced, total, total_pages, start = paginate_docs(docs, page, page_size)
     if total == 0:
@@ -411,12 +406,9 @@ def docs_page_markdown(docs, page: int, page_size: int):
     page_label = f"Trang {page}/{total_pages} — hiển thị {start+1}–{min(start+len(sliced), total)} / {total}"
     return f"**{page_label}**\n\n{body}", page_label
 
-
 # ================== PROMPT ==================
-#Tạo prompt cho LLM với context luật và lịch sử
 @log_time
-def build_prompt(query: str, docs: List[Dict[str, Any]], history_msgs=None, ):
-    
+def build_prompt(query: str, docs: List[Dict[str, Any]], history_msgs=None):
     history_block = ""
     if history_msgs:
         lines = []
@@ -438,7 +430,7 @@ def build_prompt(query: str, docs: List[Dict[str, Any]], history_msgs=None, ):
 
     context_lines = []
     for idx, d in enumerate(docs_sorted, 1):
-        art = d.get("article_no"); cls = d.get("clause_no"); pt  = d.get("point_letter")
+        art = d.get("article_no"); cls = d.get("clause_no"); pt = d.get("point_letter")
         parts = []
         if pt: parts.append(f"Điểm {pt}")
         if cls: parts.append(f"khoản {cls}")
@@ -464,7 +456,6 @@ def build_prompt(query: str, docs: List[Dict[str, Any]], history_msgs=None, ):
     - Giải thích: <1–3 câu, áp dụng tình huống>
     - Kết luận: <kết luận ngắn gọn dựa vào câu hỏi và giải thích>
 
-
     Câu hỏi hiện tại:
     \"\"\"{query}\"\"\"{history_block}
 
@@ -475,18 +466,19 @@ def build_prompt(query: str, docs: List[Dict[str, Any]], history_msgs=None, ):
     return prompt
 
 # ================== LLM STREAM ==================
-#Gọi Gemini AI để stream trả lời.
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
-def _gemini_stream(prompt, temperature: float):
+def _gemini_stream(prompt, temperature: float):  # Đổi từ async def thành def
     cfg = genai.types.GenerationConfig(temperature=float(temperature))
     return answer_model.generate_content(prompt, generation_config=cfg, stream=True)
-#Stream trả lời LLM ra UI
+
 @log_time
-def stream_answer(prompt, temperature=0.2):
-    t0 = time.perf_counter(); t_first0 = time.perf_counter(); first_token_emitted = False
+def stream_answer(prompt, temperature=0.2):  # Đổi từ async def thành def
+    t0 = time.perf_counter()
+    t_first0 = time.perf_counter()
+    first_token_emitted = False
     try:
-        resp = _gemini_stream(prompt, temperature)
-        for ch in resp:
+        resp = _gemini_stream(prompt, temperature)  # Bỏ await
+        for ch in resp:  # Đổi từ async for thành for
             if getattr(ch, "text", None):
                 if not first_token_emitted:
                     log_step("llm_first_token", do_truoc=f"{time.perf_counter()-t_first0:.4f}")
@@ -498,8 +490,7 @@ def stream_answer(prompt, temperature=0.2):
     finally:
         log_step("llm_tong", t=f"{time.perf_counter()-t0:.4f}")
 
-# -------- Qdrant Fetch Helper --------
-#Lấy document từ Qdrant dựa trên filters.
+# ================== Qdrant Fetch Helper ==================
 @log_time
 def _fetch(filters: Dict[str, Any], limit: int = 10):
     must = []
@@ -550,8 +541,15 @@ def _fetch(filters: Dict[str, Any], limit: int = 10):
         app_log.warning("FETCH_NO_OUT", extra={"__kv__": {"filters": str(filters)}})
     return out
 
-# ================== UI (tối giản, đúng state) ==================
-# CSS
+# ================== UI HELPER ==================
+def ui_return(msg_val, chatbot_val, cites_val, last_answer_val, docs_val, page_val, page_label_val, history_val):
+    print("DEBUG: ui_return called, yielding 8 values")
+    return (
+        msg_val, chatbot_val, gr.update(value=cites_val), last_answer_val,
+        docs_val, page_val, page_label_val, history_val
+    )
+
+# ================== UI ==================
 CSS = """
 #chatbot { height: 540px !important; }
 label { font-size:12px !important; opacity:.9 }
@@ -621,27 +619,21 @@ with gr.Blocks(
     state_docs = gr.State([])
     state_page = gr.State(1)
 
-    # Helper để đảm bảo đúng thứ tự/đủ outputs
-    #Chuẩn hóa output cho Gradio UI.
-    def ui_return(msg_val, chatbot_val, cites_val, last_answer_val, docs_val, page_val, page_label_val, history_val):
-        return (
-            msg_val, chatbot_val, gr.update(value=cites_val), last_answer_val,
-            docs_val, page_val, page_label_val, history_val
-        )
-
-    
-        # -------- Core Handler (Streaming) --------
-    #Xử lý input từ người dùng, phân loại intent, tìm luật, tạo prompt, stream trả lời.
-    @log_time   
-    def respond(message, history_msgs, cur_page_size, k=15 , temperature=0.2, threshold=0.42):
+    # -------- Core Handler (Async Generator) --------
+    @log_time
+    async def respond(message, history_msgs, cur_page_size, k=15, temperature=0.2, threshold=0.42):
+        print(f"DEBUG: respond async started with message: {message}")
         if not (message and message.strip()):
+            print("DEBUG: Empty message, returning default")
             gr.Info("Vui lòng nhập câu hỏi.")
             return ui_return(gr.update(), history_msgs, "", "", [], 1, "Trang 0/0", history_msgs)
 
         t_overall0 = time.perf_counter()
         try:
             # ---------- intent detection (Gemini lần 1, chỉ nội bộ) ----------
-            intent_info = analyze_intent(message)
+            print("DEBUG: Calling analyze_intent")
+            intent_info = analyze_intent(message)  # Bỏ await
+            print(f"DEBUG: Intent result: {intent_info}")
             intent = intent_info["intent"]
             intent_answer = intent_info.get("answer", "")
             normalized_query = intent_info.get("normalized_query", message)
@@ -653,7 +645,6 @@ with gr.Blocks(
                 final_answer = (intent_answer or "").replace("\u200b", "").strip()
                 app_log.info("CASUAL_BRANCH", extra={"__kv__": {"ans_len": len(final_answer)}})
 
-                # Giới hạn số từ nếu cấu hình
                 if final_answer and CASUAL_MAX_WORDS > 0:
                     words = final_answer.split()
                     if len(words) > CASUAL_MAX_WORDS:
@@ -664,63 +655,59 @@ with gr.Blocks(
                         )
                         final_answer = truncated
 
-                # Nếu Gemini đã trả sẵn answer → dùng luôn
                 if len(final_answer) >= 1:
                     history_msgs = history_msgs + [
                         {"role": "user", "content": message},
                         {"role": "assistant", "content": final_answer},
                     ]
-                    yield ui_return(gr.update(value=""), history_msgs, "(Không có trích dẫn)", final_answer, [], 1, "Trang 0/0", history_msgs)
-                    log_step("hoan_tat", t_tong=f"{time.perf_counter()-t_overall0:.4f}", t_llm="casual_direct")
-                    return
+                    print("DEBUG: Returning casual direct answer")
+                    return ui_return(gr.update(value=""), history_msgs, "(Không có trích dẫn)", final_answer, [], 1, "Trang 0/0", history_msgs)
 
-                # Nếu không có answer → fallback gọi Gemini stream ngắn
                 simple_prompt = "Trả lời thân thiện ngắn gọn (<=2 câu) tiếng Việt cho câu: " + message
                 history_msgs = history_msgs + [
                     {"role": "user", "content": message},
                     {"role": "assistant", "content": ""},
                 ]
                 acc = ""
-                for chunk in stream_answer(simple_prompt, temperature=float(temperature)):
+                print("DEBUG: Starting casual stream")
+                for chunk in stream_answer(simple_prompt, temperature=float(temperature)):  # Đổi từ async for thành for
                     acc += chunk
                     history_msgs[-1]["content"] = acc
-                    yield ui_return(gr.update(value=""), history_msgs, "(Không có trích dẫn)", acc, [], 1, "Trang 0/0", history_msgs)
-                log_step("hoan_tat", t_tong=f"{time.perf_counter()-t_overall0:.4f}", t_llm="casual_stream")
-                return
+                print("DEBUG: Returning casual stream result")
+                return ui_return(gr.update(value=""), history_msgs, "(Không có trích dẫn)", acc, [], 1, "Trang 0/0", history_msgs)
 
             # ===== LAW_SEARCH & LEGAL_ANSWER =====
             docs: List[Dict[str, Any]] = []
             source = None
 
             if intent == "law_search":
+                print("DEBUG: Fetching law_search docs")
                 docs = _fetch(intent_filters, limit=int(k)) if intent_filters else []
                 source = "law_search"
 
             elif intent == "legal_answer":
+                print("DEBUG: Searching legal_answer docs")
                 docs = search_law(normalized_query, top_k=int(k), score_threshold=float(threshold))
                 source = "legal_answer"
 
             else:
-                # fallback: intent không xác định
                 reply = INTENT_FALLBACK_CASUAL
                 history_msgs = history_msgs + [
                     {"role": "user", "content": message},
                     {"role": "assistant", "content": reply},
                 ]
-                yield ui_return(gr.update(value=""), history_msgs, "(Không có trích dẫn)", reply, [], 1, "Trang 0/0", history_msgs)
-                return
+                print("DEBUG: Returning fallback intent")
+                return ui_return(gr.update(value=""), history_msgs, "(Không có trích dẫn)", reply, [], 1, "Trang 0/0", history_msgs)
 
-            # Nếu không tìm thấy docs
             if not docs:
                 reply = "Chưa tìm thấy cơ sở pháp lý phù hợp. Bạn có thể bổ sung Điều/Khoản hoặc thêm bối cảnh."
                 upd = history_msgs + [
                     {"role": "user", "content": message},
                     {"role": "assistant", "content": reply},
                 ]
-                yield ui_return(gr.update(value=""), upd, "(Chưa có dữ liệu)", reply, [], 1, "Trang 0/0", upd)
-                return
+                print("DEBUG: Returning no docs found")
+                return ui_return(gr.update(value=""), upd, "(Chưa có dữ liệu)", reply, [], 1, "Trang 0/0", upd)
 
-            # Chuẩn bị citations + prompt (cho Gemini lần 2)
             if intent == "legal_answer":
                 user_query = original_query or message
             elif intent == "law_search":
@@ -731,37 +718,35 @@ with gr.Blocks(
             prompt = build_prompt(user_query, docs, history_msgs)
             
             log_step("llm_chuanbi", k_docs=len(docs), source=source)
+            print(f"DEBUG: Prepared prompt, docs count: {len(docs)}")
 
-            # Stream Gemini answer (Gemini lần 2, trả ra UI)
             history_msgs = history_msgs + [
                 {"role": "user", "content": message},
                 {"role": "assistant", "content": ""},
             ]
             acc = ""
             t_llm0 = time.perf_counter()
-            for chunk in stream_answer(prompt, temperature=float(temperature)):
+            print("DEBUG: Starting legal stream")
+            for chunk in stream_answer(prompt, temperature=float(temperature)):  # Đổi từ async for thành for
                 acc += chunk
                 history_msgs[-1]["content"] = acc
-                yield ui_return(gr.update(value=""), history_msgs, cites_markdown, acc, docs, 1, page_label, history_msgs)
-
-            log_step("hoan_tat", source=source, t_tong=f"{time.perf_counter()-t_overall0:.4f}", t_llm=f"{time.perf_counter()-t_llm0:.4f}")
-            return 
+            print("DEBUG: Returning legal stream result")
+            return ui_return(gr.update(value=""), history_msgs, cites_markdown, acc, docs, 1, page_label, history_msgs)
 
         except Exception as e:
             app_log.error("RESPOND_ERR", extra={"__kv__": {"err": str(e)}})
+            print(f"DEBUG: Exception in respond: {e}")
             return ui_return(gr.update(value=""), history_msgs, "(Lỗi hệ thống)", f"Lỗi: {e}", [], 1, "Trang 0/0", history_msgs)
-
 
     # Wiring outputs
     outputs = [msg, chatbot, cites_md, state_last_answer, state_docs, state_page, page_info, state_history]
-    send.click(respond, inputs=[msg, state_history,page_size], outputs=outputs, queue=True)
-    msg.submit(respond, inputs=[msg, state_history, page_size], outputs=outputs, queue=True)
-
-
+    send.click(respond, inputs=[msg, state_history, page_size], outputs=outputs, queue=False)
+    msg.submit(respond, inputs=[msg, state_history, page_size], outputs=outputs, queue=False)
     # Like/Dislike
     def on_like(data: gr.LikeData):
         msg_like = data.value or {}
-        role = msg_like.get("role", "assistant"); text = msg_like.get("content", "")
+        role = msg_like.get("role", "assistant")
+        text = msg_like.get("content", "")
         app_log.info("FEEDBACK", extra={"__kv__": {"liked": data.liked, "role": role, "len": len(text or "")}})
         return None
     chatbot.like(on_like)
@@ -796,4 +781,5 @@ with gr.Blocks(
     """)
 
 if __name__ == "__main__":
-    demo.launch(show_error=True)
+    demo.queue()
+    demo.launch(show_error=True, share=True)
