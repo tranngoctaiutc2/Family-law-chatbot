@@ -1,11 +1,11 @@
 import asyncio
 import os
-from datetime import datetime
-from textwrap import dedent
-import logging
-import time
 import re
 import json
+import time
+import logging
+from datetime import datetime
+from textwrap import dedent
 from typing import List, Dict, Any, Optional, Tuple
 
 import gradio as gr
@@ -15,8 +15,9 @@ from sentence_transformers import SentenceTransformer
 import google.generativeai as genai
 from qdrant_client.http.models import Filter, FieldCondition, MatchValue
 from tenacity import retry, stop_after_attempt, wait_exponential
+from rank_bm25 import BM25Okapi
 
-# ================== ENV ==================
+# ================== CẤU HÌNH MÔI TRƯỜNG ==================
 load_dotenv()
 QDRANT_URL = os.getenv("QDRANT_URL", "").strip()
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY", "").strip()
@@ -35,9 +36,9 @@ INTENT_FALLBACK_CASUAL = os.getenv(
 ).strip()
 
 if not (QDRANT_URL and QDRANT_API_KEY):
-    raise RuntimeError("Thiếu QDRANT_URL / QDRANT_API_KEY trong .env")
+    raise RuntimeError("Thiếu QDRANT_URL hoặc QDRANT_API_KEY trong tệp .env")
 
-# ================== LOGGING ==================
+# ================== THIẾT LẬP LOGGING ==================
 class KVFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         base = super().format(record)
@@ -52,7 +53,10 @@ class KVFormatter(logging.Formatter):
         return base + (" | " + ",".join(extras) if extras else "")
 
 LOG_FORMAT = "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
-handlers = [logging.StreamHandler(), logging.FileHandler("botchat_honnhan.log", encoding="utf-8")]
+handlers = [
+    logging.StreamHandler(),
+    logging.FileHandler("botchat_honnhan.log", encoding="utf-8"),
+]
 for h in handlers:
     h.setFormatter(KVFormatter(LOG_FORMAT))
 
@@ -77,30 +81,25 @@ def log_step(event: str, **kv):
 def log_time(func):
     import functools
     @functools.wraps(func)
-    async def async_wrapper(*args, **kwargs):
-        t0 = time.perf_counter()
-        try:
-            return await func(*args, **kwargs)
-        finally:
-            elapsed = time.perf_counter() - t0
-            app_log.info(f"{func.__name__}_TIME", extra={"__kv__": {"elapsed_sec": f"{elapsed:.4f}"}})
-    @functools.wraps(func)
     def sync_wrapper(*args, **kwargs):
         t0 = time.perf_counter()
         try:
             return func(*args, **kwargs)
         finally:
             elapsed = time.perf_counter() - t0
-            app_log.info(f"{func.__name__}_TIME", extra={"__kv__": {"elapsed_sec": f"{elapsed:.4f}"}})
-    return async_wrapper if asyncio.iscoroutinefunction(func) else sync_wrapper
+            app_log.info(
+                f"Thời gian thực thi {func.__name__}",
+                extra={"__kv__": {"thoi_gian": f"{elapsed:.4f} giây"}},
+            )
+    return sync_wrapper
 
-# ================== INIT ==================
+# ================== KHỞI TẠO ==================
 client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, prefer_grpc=True)
 embedder = SentenceTransformer(EMBEDDING_MODEL)
 
 genai.configure()
 INTENT_SYSTEM_PROMPT = dedent("""
-Bạn là trợ lý về Luật HN&GĐ VN.
+Bạn là trợ lý về Luật Hôn nhân & Gia đình Việt Nam.
 Trả về **JSON thuần** (không markdown, không lời dẫn).
 
 Schema một trong các dạng:
@@ -120,11 +119,9 @@ gemini_model = genai.GenerativeModel(
     model_name=GEMINI_MODEL_ID,
     system_instruction=INTENT_SYSTEM_PROMPT,
 )
-answer_model = genai.GenerativeModel(
-    model_name=GEMINI_MODEL_ID,
-)
+answer_model = genai.GenerativeModel(model_name=GEMINI_MODEL_ID)
 
-# ================== HELPERS ==================
+# ================== HÀM HỖ TRỢ ==================
 def _safe_truncate(text: str, limit: int = 800) -> str:
     return text if text and len(text) <= limit else (text[:limit] + "…(cắt)") if text else ""
 
@@ -165,6 +162,7 @@ class SimpleTTLCache:
 embed_cache = SimpleTTLCache(ttl_seconds=3600, max_items=1024)
 search_cache = SimpleTTLCache(ttl_seconds=900, max_items=1024)
 
+@log_time
 def encode_query(text: str):
     key = f"{EMBEDDING_MODEL}|query|{text}"
     v = embed_cache.get(key)
@@ -174,16 +172,15 @@ def encode_query(text: str):
     embed_cache.set(key, vec)
     return vec
 
-# ================== INTENT ==================
+# ================== PHÂN TÍCH Ý ĐỊNH (INTENT) ==================
 @log_time
-def _intent_via_gemini(query: str) -> Dict[str, Any]:  # Đổi từ async def thành def (không async)
+def _intent_via_gemini(query: str) -> Dict[str, Any]:
     try:
         cfg = genai.types.GenerationConfig(
             temperature=0.0,
             max_output_tokens=192,
             response_mime_type="application/json",
         )
-        # Bỏ await, gọi đồng bộ
         resp = gemini_model.generate_content(
             [
                 {
@@ -209,57 +206,58 @@ def _intent_via_gemini(query: str) -> Dict[str, Any]:  # Đổi từ async def t
 
         raw = getattr(resp, "text", "") or ""
         app_log.info(
-            "INTENT_RAW",
+            "Kết quả phân tích ý định",
             extra={
                 "__kv__": {
-                    "len": len(raw),
-                    "preview": _safe_truncate(raw, INTENT_RAW_PREVIEW_LIMIT),
-                    "candidates": len(candidates),
-                    "finish_reason": finish_reason,
-                    "safety": ";".join(safety[:6]),
+                    "do_dai": len(raw),
+                    "xem_truoc": _safe_truncate(raw, INTENT_RAW_PREVIEW_LIMIT),
+                    "so_ung_vien": len(candidates),
+                    "ly_do_ket_thuc": finish_reason,
+                    "bao_mat": ";".join(safety[:6]),
                 }
             },
         )
 
         if finish_reason == 2 or not raw:
-            log_step("intent_block", reason=str(finish_reason))
+            log_step("intent_block", ly_do=str(finish_reason))
             app_log.warning(
-                "INTENT_BLOCKED", extra={"__kv__": {"finish_reason": finish_reason, "raw_len": len(raw)}}
+                "Phân tích ý định bị chặn",
+                extra={"__kv__": {"ly_do_ket_thuc": finish_reason, "do_dai_raw": len(raw)}}
             )
             return {"intent": "casual", "answer": INTENT_FALLBACK_CASUAL}
 
         data = json.loads(raw) if raw else {}
         if not isinstance(data, dict):
-            app_log.warning("INTENT_NON_DICT")
+            app_log.warning("Kết quả phân tích không phải dict")
             return {"intent": "casual", "answer": INTENT_FALLBACK_CASUAL}
         out: Dict[str, Any] = {}
         for k in ("intent", "answer", "normalized_query", "filters", "original_query"):
             if k in data and data[k] not in (None, ""):
                 out[k] = data[k]
         app_log.info(
-            "INTENT_PARSED",
+            "Ý định đã phân tích",
             extra={
                 "__kv__": {
-                    "intent": out.get("intent", ""),
-                    "has_answer": int("answer" in out and bool(out.get("answer"))),
-                    "has_filters": int("filters" in out and bool(out.get("filters"))),
-                    "ans_len": len(out.get("answer", "") or ""),
-                    "finish_reason": finish_reason,
+                    "loai_y_dinh": out.get("intent", ""),
+                    "co_tra_loi": int("answer" in out and bool(out.get("answer"))),
+                    "co_bo_loc": int("filters" in out and bool(out.get("filters"))),
+                    "do_dai_tra_loi": len(out.get("answer", "") or ""),
+                    "ly_do_ket_thuc": finish_reason,
                 }
             },
         )
         return out
     except Exception as e:
-        app_log.warning("INTENT_ERR", extra={"__kv__": {"err": str(e)}})
+        app_log.warning("Lỗi phân tích ý định", extra={"__kv__": {"loi": str(e)}})
         return {"intent": "casual", "answer": INTENT_FALLBACK_CASUAL}
 
 @log_time
-def analyze_intent(query: str) -> Dict[str, Any]:  # Đổi từ async def thành def
-    data = _intent_via_gemini(query)  # Bỏ await
+def analyze_intent(query: str) -> Dict[str, Any]:
+    data = _intent_via_gemini(query)
     intent = data.get("intent")
     answer = data.get("answer", "")
     normalized_query = data.get("normalized_query", "") or query
-    original_query = data.get("original_query", "") 
+    original_query = data.get("original_query", "")
     filters = data.get("filters", {}) or {}
 
     if intent not in {"casual", "legal_answer", "law_search"}:
@@ -269,12 +267,58 @@ def analyze_intent(query: str) -> Dict[str, Any]:  # Đổi từ async def thàn
             intent = "legal_answer"
         else:
             intent = "casual"
-        log_step("intent_fallback", qlen=len(query))
+        log_step("intent_fallback", do_dai_query=len(query))
 
     log_step("intent", loai=intent, co_legal=str(looks_like_legal(query)))
-    app_log.info("INTENT_DECISION", extra={"__kv__": {"intent": intent}})
-    return {"intent": intent, "answer": answer, "normalized_query": normalized_query, "original_query": original_query, "filters": filters}
-# ================== HIBRID SEARCH ==================
+    app_log.info("Quyết định ý định", extra={"__kv__": {"loai_y_dinh": intent}})
+    return {
+        "intent": intent,
+        "answer": answer,
+        "normalized_query": normalized_query,
+        "original_query": original_query,
+        "filters": filters,
+    }
+
+# ================== TÌM KIẾM BM25 ==================
+def tokenize(text):
+    return re.findall(r'\w+', text.lower())
+
+@log_time
+def rank_by_bm25(docs: list, query: str):
+    corpus = [tokenize(d['content']) for d in docs]
+    bm25 = BM25Okapi(corpus)
+    tokenized_query = tokenize(query)
+    scores = bm25.get_scores(tokenized_query)
+    for d, s in zip(docs, scores):
+        d['bm25_score'] = float(s)
+    ranked_docs = sorted(docs, key=lambda x: x['bm25_score'], reverse=True)
+    return ranked_docs
+
+@log_time
+def rerank_bm25(query: str, docs: list) -> list:
+    corpus = [d.get("content", "") for d in docs]
+    if not corpus:
+        return docs
+
+    bm25 = BM25Okapi([doc.split() for doc in corpus])
+    scores = bm25.get_scores(query.split())
+
+    for d, s in zip(docs, scores):
+        d["bm25_score"] = float(s)
+
+    reranked = sorted(docs, key=lambda x: x["bm25_score"], reverse=True)
+
+    print("DEBUG: Kết quả sắp xếp lại BM25:")
+    for i, d in enumerate(reranked, 1):
+        print(
+            f"  {i}. Điểm BM25={d['bm25_score']:.4f}, "
+            f"Điểm gốc={d.get('score', 0.0):.4f}, "
+            f"Nội dung xem trước={d['content'][:50]}..."
+        )
+
+    return reranked
+
+# ================== TÌM KIẾM HYBRID ==================
 @log_time
 def _build_filter(query_text: str) -> Optional[Filter]:
     conds: List[FieldCondition] = []
@@ -295,12 +339,15 @@ def _build_filter(query_text: str) -> Optional[Filter]:
 @log_time
 def search_law(query: str, top_k: int = 15, score_threshold: float = 0.42):
     t0 = time.perf_counter()
-    app_log.info("SEARCH_BEGIN", extra={"__kv__": {"q": _safe_truncate(query, 80), "k": top_k, "thr": score_threshold}})
+    app_log.info(
+        "Bắt đầu tìm kiếm",
+        extra={"__kv__": {"cau_hoi": _safe_truncate(query, 80), "top_k": top_k, "nguong_diem": score_threshold}},
+    )
 
     cache_key = f"search|{COLLECTION_NAME}|{top_k}|{score_threshold}|{query}"
     cached = search_cache.get(cache_key)
     if cached is not None:
-        app_log.info("SEARCH_CACHE_HIT")
+        app_log.info("Tìm kiếm từ bộ nhớ cache")
         return cached
 
     try:
@@ -311,17 +358,17 @@ def search_law(query: str, top_k: int = 15, score_threshold: float = 0.42):
         flt = _build_filter(query)
 
         t_q0 = time.perf_counter()
-        results = client.search(
+        results = client.query_points(
             collection_name=COLLECTION_NAME,
-            query_vector=vec,
+            query=vec,
             with_payload=True,
             limit=max(1, min(int(top_k) * 3, 80)),
-            query_filter=flt
+            query_filter=flt,
         )
         t_qdrant = time.perf_counter() - t_q0
 
         raw_docs = []
-        for r in results:
+        for r in results.points:
             p = r.payload or {}
             raw_docs.append({
                 "citation": p.get("exact_citation", ""),
@@ -336,36 +383,47 @@ def search_law(query: str, top_k: int = 15, score_threshold: float = 0.42):
 
         t_filter0 = time.perf_counter()
         filtered = [d for d in raw_docs if d.get("score", 0.0) >= score_threshold] or raw_docs[:max(1, top_k)]
+        filtered = rerank_bm25(query, filtered)
         t_filter = time.perf_counter() - t_filter0
 
         selected = filtered[:top_k]
+        selected = rank_by_bm25(selected, query)[:top_k]
+
         search_cache.set(cache_key, selected)
 
         sk_top1 = selected[0]['score'] if selected else 0.0
         log_step(
             "tim_kiem",
             k_yeu_cau=top_k,
-            k_tra=f"{len(selected)}",
-            sk_top1=f"{sk_top1:.4f}",
-            t_embed=f"{t_embed:.4f}",
+            k_tra_ve=len(selected),
+            diem_top1=f"{sk_top1:.4f}",
+            t_nhung=f"{t_embed:.4f}",
             t_qdrant=f"{t_qdrant:.4f}",
             t_loc=f"{t_filter:.4f}",
-            t_tong=f"{time.perf_counter()-t0:.4f}"
+            t_tong=f"{time.perf_counter()-t0:.4f}",
         )
-        app_log.info("SEARCH_DONE", extra={"__kv__": {"count": len(selected), "top1": f"{sk_top1:.4f}"}})
+        app_log.info(
+            "Tìm kiếm hoàn tất",
+            extra={"__kv__": {"so_luong": len(selected), "diem_top1": f"{sk_top1:.4f}"}},
+        )
         return selected
     except Exception as e:
-        app_log.error("SEARCH_ERR", extra={"__kv__": {"err": str(e)}})
-        log_step("tim_kiem_loi", msg=str(e))
+        app_log.error("Lỗi tìm kiếm", extra={"__kv__": {"loi": str(e)}})
+        log_step("tim_kiem_loi", thong_bao=str(e))
         raise
 
-# ================== RENDER UTILS ==================
+# ================== CÔNG CỤ RENDER ==================
 def law_line(d: Dict[str, Any]) -> Tuple[str, str, str]:
-    art = d.get("article_no"); cls = d.get("clause_no"); pt = d.get("point_letter")
+    art = d.get("article_no")
+    cls = d.get("clause_no")
+    pt = d.get("point_letter")
     parts = []
-    if pt: parts.append(f"Điểm {pt}")
-    if cls: parts.append(f"khoản {cls}")
-    if art: parts.append(f"điều {art}")
+    if pt:
+        parts.append(f"Điểm {pt}")
+    if cls:
+        parts.append(f"Khoản {cls}")
+    if art:
+        parts.append(f"Điều {art}")
     cited = " ".join(parts)
     chapter = f" (Chương {d.get('chapter_number')})" if d.get("chapter_number") else ""
     title = f" — {d.get('article_title')}" if d.get("article_title") else ""
@@ -380,8 +438,8 @@ def docs_to_markdown(docs: List[Dict[str, Any]]):
         content = (d.get("content") or "").strip()
         score = round(d.get("score", 0.0), 4)
         lines.append(
-            f"**{i}.  {cited}{chapter}{title}**  \n" +
-            f"{content}  \n" +
+            f"**{i}. {cited}{chapter}{title}**  \n"
+            f"{content}  \n"
             f"<sub>Độ liên quan: {score}</sub>\n"
         )
     return "\n".join(lines)
@@ -406,7 +464,7 @@ def docs_page_markdown(docs, page: int, page_size: int):
     page_label = f"Trang {page}/{total_pages} — hiển thị {start+1}–{min(start+len(sliced), total)} / {total}"
     return f"**{page_label}**\n\n{body}", page_label
 
-# ================== PROMPT ==================
+# ================== XÂY DỰNG PROMPT ==================
 @log_time
 def build_prompt(query: str, docs: List[Dict[str, Any]], history_msgs=None):
     history_block = ""
@@ -424,17 +482,22 @@ def build_prompt(query: str, docs: List[Dict[str, Any]], history_msgs=None):
         key=lambda d: (
             int(d.get("article_no") or 9999),
             int(d.get("clause_no") or 9999),
-            str(d.get("point_letter") or "")
-        )
+            str(d.get("point_letter") or ""),
+        ),
     )
 
     context_lines = []
     for idx, d in enumerate(docs_sorted, 1):
-        art = d.get("article_no"); cls = d.get("clause_no"); pt = d.get("point_letter")
+        art = d.get("article_no")
+        cls = d.get("clause_no")
+        pt = d.get("point_letter")
         parts = []
-        if pt: parts.append(f"Điểm {pt}")
-        if cls: parts.append(f"khoản {cls}")
-        if art: parts.append(f"điều {art}")
+        if pt:
+            parts.append(f"Điểm {pt}")
+        if cls:
+            parts.append(f"Khoản {cls}")
+        if art:
+            parts.append(f"Điều {art}")
         cited = " ".join(parts)
         chapter = f" (Chương {d.get('chapter_number')})" if d.get("chapter_number") else ""
         title = f" — {d.get('article_title')}" if d.get("article_title") else ""
@@ -444,7 +507,7 @@ def build_prompt(query: str, docs: List[Dict[str, Any]], history_msgs=None):
     context = "\n".join(context_lines) if context_lines else "❌ Không có điều luật nào."
 
     prompt = dedent(f"""
-    Bạn là luật sư tư vấn Luật Hôn nhân & Gia Đình, chỉ dùng trích đoạn trong danh sách sau. 
+    Bạn là luật sư tư vấn Luật Hôn nhân & Gia đình, chỉ dùng trích đoạn trong danh sách sau.
     Quy tắc:
     - Câu hỏi Đúng/Sai → trả lời **Kết luận: Đúng/Sai** + lý do.
     - Câu hỏi thường → trả lời **1–3 câu**, bám sát câu hỏi.
@@ -465,32 +528,32 @@ def build_prompt(query: str, docs: List[Dict[str, Any]], history_msgs=None):
 
     return prompt
 
-# ================== LLM STREAM ==================
+# ================== XỬ LÝ TRẢ LỜI LLM ==================
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
-def _gemini_stream(prompt, temperature: float):  # Đổi từ async def thành def
+def _gemini_stream(prompt, temperature: float):
     cfg = genai.types.GenerationConfig(temperature=float(temperature))
     return answer_model.generate_content(prompt, generation_config=cfg, stream=True)
 
 @log_time
-def stream_answer(prompt, temperature=0.2):  # Đổi từ async def thành def
+def stream_answer(prompt, temperature=0.2):
     t0 = time.perf_counter()
     t_first0 = time.perf_counter()
     first_token_emitted = False
     try:
-        resp = _gemini_stream(prompt, temperature)  # Bỏ await
-        for ch in resp:  # Đổi từ async for thành for
+        resp = _gemini_stream(prompt, temperature)
+        for ch in resp:
             if getattr(ch, "text", None):
                 if not first_token_emitted:
-                    log_step("llm_first_token", do_truoc=f"{time.perf_counter()-t_first0:.4f}")
+                    log_step("llm_first_token", thoi_gian_truoc=f"{time.perf_counter()-t_first0:.4f}")
                     first_token_emitted = True
                 yield ch.text
     except Exception as e:
-        app_log.error("LLM_ERR", extra={"__kv__": {"err": str(e)}})
+        app_log.error("Lỗi gọi mô hình LLM", extra={"__kv__": {"loi": str(e)}})
         yield f"\n\nLỗi gọi mô hình: {e}"
     finally:
-        log_step("llm_tong", t=f"{time.perf_counter()-t0:.4f}")
+        log_step("llm_tong", thoi_gian=f"{time.perf_counter()-t0:.4f}")
 
-# ================== Qdrant Fetch Helper ==================
+# ================== LẤY DỮ LIỆU QDRANT ==================
 @log_time
 def _fetch(filters: Dict[str, Any], limit: int = 10):
     must = []
@@ -501,15 +564,21 @@ def _fetch(filters: Dict[str, Any], limit: int = 10):
                 val = caster(filters[k])
                 must.append(FieldCondition(key=k, match=MatchValue(value=val)))
             except Exception as e:
-                app_log.warning("FETCH_CAST_ERROR", extra={"__kv__": {"key": k, "value": filters[k], "error": str(e)}})
+                app_log.warning(
+                    "Lỗi ép kiểu dữ liệu bộ lọc",
+                    extra={"__kv__": {"truong": k, "gia_tri": filters[k], "loi": str(e)}},
+                )
                 try:
                     val = str(filters[k])
                     must.append(FieldCondition(key=k, match=MatchValue(value=val)))
                 except:
                     pass
-    app_log.info("FETCH_FILTERS", extra={"__kv__": {"raw_filters": str(filters), "must_conditions": str(must)}})
+    app_log.info(
+        "Bộ lọc tìm kiếm",
+        extra={"__kv__": {"bo_loc_goc": str(filters), "dieu_kien_must": str(must)}},
+    )
     if not must:
-        app_log.warning("FETCH_NO_MUST")
+        app_log.warning("Không có điều kiện must")
         return []
     flt = Filter(must=must)
     out = []
@@ -518,9 +587,12 @@ def _fetch(filters: Dict[str, Any], limit: int = 10):
             collection_name=COLLECTION_NAME,
             scroll_filter=flt,
             limit=min(64, max(5, limit)),
-            with_payload=True
+            with_payload=True,
         )
-        app_log.info("FETCH_SCROLL_RESULTS", extra={"__kv__": {"count": len(scroll_res), "collection": COLLECTION_NAME}})
+        app_log.info(
+            "Kết quả tìm kiếm Qdrant",
+            extra={"__kv__": {"so_luong": len(scroll_res), "collection": COLLECTION_NAME}},
+        )
         for r in scroll_res:
             p = r.payload or {}
             out.append({
@@ -535,39 +607,48 @@ def _fetch(filters: Dict[str, Any], limit: int = 10):
             if len(out) >= limit:
                 break
     except Exception as e:
-        app_log.error("FETCH_SCROLL_ERROR", extra={"__kv__": {"error": str(e), "collection": COLLECTION_NAME}})
+        app_log.error(
+            "Lỗi khi tìm kiếm Qdrant",
+            extra={"__kv__": {"loi": str(e), "collection": COLLECTION_NAME}},
+        )
         return []
     if not out:
-        app_log.warning("FETCH_NO_OUT", extra={"__kv__": {"filters": str(filters)}})
+        app_log.warning("Không tìm thấy kết quả", extra={"__kv__": {"bo_loc": str(filters)}})
     return out
 
-# ================== UI HELPER ==================
+# ================== HÀM HỖ TRỢ GIAO DIỆN ==================
 def ui_return(msg_val, chatbot_val, cites_val, last_answer_val, docs_val, page_val, page_label_val, history_val):
-    print("DEBUG: ui_return called, yielding 8 values")
+    print("DEBUG: Gọi hàm ui_return, trả về 8 giá trị")
     return (
-        msg_val, chatbot_val, gr.update(value=cites_val), last_answer_val,
-        docs_val, page_val, page_label_val, history_val
+        msg_val,
+        chatbot_val,
+        gr.update(value=cites_val),
+        last_answer_val,
+        docs_val,
+        page_val,
+        page_label_val,
+        history_val,
     )
 
-# ================== UI ==================
+# ================== GIAO DIỆN NGƯỜI DÙNG ==================
 CSS = """
 #chatbot { height: 540px !important; }
 label { font-size:12px !important; opacity:.9 }
-#cites-box { 
-    max-height: 360px; 
-    overflow-y: auto; 
-    border: 1px solid #ddd; 
-    padding: 6px; 
+#cites-box {
+    max-height: 360px;
+    overflow-y: auto;
+    border: 1px solid #ddd;
+    padding: 6px;
     border-radius: 6px;
     background-color: #fafafa;
 }
-#history_box { 
+#history_box {
     max-height: 200px;
 }
 """
 
 with gr.Blocks(
-    title="⚖️ Trợ lý Luật HN&GĐ 2014",
+    title="⚖️ Trợ lý Luật Hôn Nhân & Gia Đình 2014",
     css=CSS,
 ) as demo:
     gr.Markdown("""
@@ -578,7 +659,10 @@ with gr.Blocks(
     with gr.Row():
         with gr.Column(scale=7):
             chatbot = gr.Chatbot(
-                value=[], type="messages", show_copy_button=True, elem_id="chatbot"
+                value=[],
+                type="messages",
+                show_copy_button=True,
+                elem_id="chatbot",
             )
             with gr.Row():
                 ex1 = gr.Button("Chào bạn")
@@ -590,7 +674,7 @@ with gr.Blocks(
                 type="messages",
                 show_copy_button=False,
                 label="📜 Lịch sử chat",
-                elem_id="history_box"
+                elem_id="history_box",
             )
             gr.Markdown("**Cơ sở pháp lý**")
             cites_md = gr.Markdown(value="(Chưa có dữ liệu)", elem_id="cites-box")
@@ -606,52 +690,74 @@ with gr.Blocks(
         send = gr.Button("Gửi", variant="primary", scale=1)
         clear = gr.Button("Làm mới", scale=1)
 
-    # Prefill examples
+    # Điền sẵn ví dụ
     def _fill(text):
         return text
+
     ex1.click(lambda: _fill("Chào bạn"), outputs=msg)
-    ex2.click(lambda: _fill("Điều 81 quy định gì về việc nuôi con sau ly hôn"), outputs=msg)
+    ex2.click(
+        lambda: _fill("Điều 81 quy định gì về việc nuôi con sau ly hôn"),
+        outputs=msg,
+    )
     ex3.click(lambda: _fill("Khoản 2 Điều 56 nói gì"), outputs=msg)
 
-    # States
+    # Trạng thái
     state_history = gr.State([])
     state_last_answer = gr.State("")
     state_docs = gr.State([])
     state_page = gr.State(1)
 
-    # -------- Core Handler (Async Generator) --------
+    # -------- Xử lý chính (Async Generator) --------
     @log_time
-    async def respond(message, history_msgs, cur_page_size, k=15, temperature=0.2, threshold=0.42):
-        print(f"DEBUG: respond async started with message: {message}")
+    def respond(message, history_msgs, cur_page_size, k=15, temperature=0.2, threshold=0.42):
+        print(f"DEBUG: Bắt đầu xử lý câu hỏi: {message}")
         if not (message and message.strip()):
-            print("DEBUG: Empty message, returning default")
+            print("DEBUG: Câu hỏi rỗng, trả về mặc định")
             gr.Info("Vui lòng nhập câu hỏi.")
-            return ui_return(gr.update(), history_msgs, "", "", [], 1, "Trang 0/0", history_msgs)
+            return ui_return(
+                gr.update(),
+                history_msgs,
+                "",
+                "",
+                [],
+                1,
+                "Trang 0/0",
+                history_msgs,
+            )
 
         t_overall0 = time.perf_counter()
         try:
-            # ---------- intent detection (Gemini lần 1, chỉ nội bộ) ----------
-            print("DEBUG: Calling analyze_intent")
-            intent_info = analyze_intent(message)  # Bỏ await
-            print(f"DEBUG: Intent result: {intent_info}")
+            # Phân tích ý định
+            print("DEBUG: Gọi hàm phân tích ý định")
+            intent_info = analyze_intent(message)
+            print(f"DEBUG: Kết quả ý định: {intent_info}")
             intent = intent_info["intent"]
             intent_answer = intent_info.get("answer", "")
             normalized_query = intent_info.get("normalized_query", message)
             original_query = intent_info.get("original_query", message)
             intent_filters = intent_info.get("filters", {})
 
-            # ===== CASUAL =====
+            # Xử lý câu hỏi xã giao
             if intent == "casual":
                 final_answer = (intent_answer or "").replace("\u200b", "").strip()
-                app_log.info("CASUAL_BRANCH", extra={"__kv__": {"ans_len": len(final_answer)}})
+                app_log.info(
+                    "Xử lý câu hỏi xã giao",
+                    extra={"__kv__": {"do_dai_tra_loi": len(final_answer)}},
+                )
 
                 if final_answer and CASUAL_MAX_WORDS > 0:
                     words = final_answer.split()
                     if len(words) > CASUAL_MAX_WORDS:
                         truncated = " ".join(words[:CASUAL_MAX_WORDS])
                         app_log.info(
-                            "CASUAL_TRUNCATE",
-                            extra={"__kv__": {"orig_words": len(words), "kept": CASUAL_MAX_WORDS, "orig_len": len(final_answer)}},
+                            "Cắt ngắn câu trả lời xã giao",
+                            extra={
+                                "__kv__": {
+                                    "so_tu_goc": len(words),
+                                    "so_tu_giu": CASUAL_MAX_WORDS,
+                                    "do_dai_goc": len(final_answer),
+                                }
+                            },
                         )
                         final_answer = truncated
 
@@ -660,8 +766,17 @@ with gr.Blocks(
                         {"role": "user", "content": message},
                         {"role": "assistant", "content": final_answer},
                     ]
-                    print("DEBUG: Returning casual direct answer")
-                    return ui_return(gr.update(value=""), history_msgs, "(Không có trích dẫn)", final_answer, [], 1, "Trang 0/0", history_msgs)
+                    print("DEBUG: Trả về câu trả lời xã giao trực tiếp")
+                    return ui_return(
+                        gr.update(value=""),
+                        history_msgs,
+                        "(Không có trích dẫn)",
+                        final_answer,
+                        [],
+                        1,
+                        "Trang 0/0",
+                        history_msgs,
+                    )
 
                 simple_prompt = "Trả lời thân thiện ngắn gọn (<=2 câu) tiếng Việt cho câu: " + message
                 history_msgs = history_msgs + [
@@ -669,24 +784,40 @@ with gr.Blocks(
                     {"role": "assistant", "content": ""},
                 ]
                 acc = ""
-                print("DEBUG: Starting casual stream")
-                for chunk in stream_answer(simple_prompt, temperature=float(temperature)):  # Đổi từ async for thành for
+                print("DEBUG: Bắt đầu stream câu trả lời xã giao")
+                for chunk in stream_answer(simple_prompt, temperature=float(temperature)):
                     acc += chunk
                     history_msgs[-1]["content"] = acc
-                print("DEBUG: Returning casual stream result")
-                return ui_return(gr.update(value=""), history_msgs, "(Không có trích dẫn)", acc, [], 1, "Trang 0/0", history_msgs)
+                print("DEBUG: Trả về kết quả stream câu trả lời xã giao")
+                return ui_return(
+                    gr.update(value=""),
+                    history_msgs,
+                    "(Không có trích dẫn)",
+                    acc,
+                    [],
+                    1,
+                    "Trang 0/0",
+                    history_msgs,
+                )
 
-            # ===== LAW_SEARCH & LEGAL_ANSWER =====
+            # Xử lý câu hỏi tìm kiếm luật hoặc trả lời pháp lý
             docs: List[Dict[str, Any]] = []
             source = None
 
             if intent == "law_search":
-                print("DEBUG: Fetching law_search docs")
+                print("DEBUG: Tìm kiếm điều luật")
                 docs = _fetch(intent_filters, limit=int(k)) if intent_filters else []
                 source = "law_search"
+                if not docs:
+                    app_log.info(
+                        "Rơi vào tìm kiếm embedding",
+                        extra={"__kv__": {"cau_hoi": message}},
+                    )
+                    docs = search_law(message, top_k=int(k), score_threshold=float(threshold))
+                    source = "law_search_embedding_fallback"
 
             elif intent == "legal_answer":
-                print("DEBUG: Searching legal_answer docs")
+                print("DEBUG: Tìm kiếm câu trả lời pháp lý")
                 docs = search_law(normalized_query, top_k=int(k), score_threshold=float(threshold))
                 source = "legal_answer"
 
@@ -696,17 +827,38 @@ with gr.Blocks(
                     {"role": "user", "content": message},
                     {"role": "assistant", "content": reply},
                 ]
-                print("DEBUG: Returning fallback intent")
-                return ui_return(gr.update(value=""), history_msgs, "(Không có trích dẫn)", reply, [], 1, "Trang 0/0", history_msgs)
+                print("DEBUG: Trả về ý định mặc định")
+                return ui_return(
+                    gr.update(value=""),
+                    history_msgs,
+                    "(Không có trích dẫn)",
+                    reply,
+                    [],
+                    1,
+                    "Trang 0/0",
+                    history_msgs,
+                )
 
             if not docs:
-                reply = "Chưa tìm thấy cơ sở pháp lý phù hợp. Bạn có thể bổ sung Điều/Khoản hoặc thêm bối cảnh."
+                reply = (
+                    "Chưa tìm thấy cơ sở pháp lý phù hợp. "
+                    "Bạn có thể bổ sung Điều/Khoản hoặc thêm bối cảnh."
+                )
                 upd = history_msgs + [
                     {"role": "user", "content": message},
                     {"role": "assistant", "content": reply},
                 ]
-                print("DEBUG: Returning no docs found")
-                return ui_return(gr.update(value=""), upd, "(Chưa có dữ liệu)", reply, [], 1, "Trang 0/0", upd)
+                print("DEBUG: Không tìm thấy tài liệu")
+                return ui_return(
+                    gr.update(value=""),
+                    upd,
+                    "(Chưa có dữ liệu)",
+                    reply,
+                    [],
+                    1,
+                    "Trang 0/0",
+                    upd,
+                )
 
             if intent == "legal_answer":
                 user_query = original_query or message
@@ -716,9 +868,9 @@ with gr.Blocks(
                 user_query = message
             cites_markdown, page_label = docs_page_markdown(docs, 1, int(cur_page_size))
             prompt = build_prompt(user_query, docs, history_msgs)
-            
-            log_step("llm_chuanbi", k_docs=len(docs), source=source)
-            print(f"DEBUG: Prepared prompt, docs count: {len(docs)}")
+
+            log_step("llm_chuanbi", so_tai_lieu=len(docs), nguon=source)
+            print(f"DEBUG: Đã chuẩn bị prompt, số tài liệu: {len(docs)}")
 
             history_msgs = history_msgs + [
                 {"role": "user", "content": message},
@@ -726,32 +878,64 @@ with gr.Blocks(
             ]
             acc = ""
             t_llm0 = time.perf_counter()
-            print("DEBUG: Starting legal stream")
-            for chunk in stream_answer(prompt, temperature=float(temperature)):  # Đổi từ async for thành for
+            print("DEBUG: Bắt đầu stream câu trả lời pháp lý")
+            for chunk in stream_answer(prompt, temperature=float(temperature)):
                 acc += chunk
                 history_msgs[-1]["content"] = acc
-            print("DEBUG: Returning legal stream result")
-            return ui_return(gr.update(value=""), history_msgs, cites_markdown, acc, docs, 1, page_label, history_msgs)
+            print("DEBUG: Trả về kết quả stream câu trả lời pháp lý")
+            return ui_return(
+                gr.update(value=""),
+                history_msgs,
+                cites_markdown,
+                acc,
+                docs,
+                1,
+                page_label,
+                history_msgs,
+            )
 
         except Exception as e:
-            app_log.error("RESPOND_ERR", extra={"__kv__": {"err": str(e)}})
-            print(f"DEBUG: Exception in respond: {e}")
-            return ui_return(gr.update(value=""), history_msgs, "(Lỗi hệ thống)", f"Lỗi: {e}", [], 1, "Trang 0/0", history_msgs)
+            app_log.error("Lỗi xử lý câu hỏi", extra={"__kv__": {"loi": str(e)}})
+            print(f"DEBUG: Lỗi trong xử lý: {e}")
+            return ui_return(
+                gr.update(value=""),
+                history_msgs,
+                "(Lỗi hệ thống)",
+                f"Lỗi: {e}",
+                [],
+                1,
+                "Trang 0/0",
+                history_msgs,
+            )
 
-    # Wiring outputs
-    outputs = [msg, chatbot, cites_md, state_last_answer, state_docs, state_page, page_info, state_history]
+    # Kết nối outputs
+    outputs = [
+        msg,
+        chatbot,
+        cites_md,
+        state_last_answer,
+        state_docs,
+        state_page,
+        page_info,
+        state_history,
+    ]
     send.click(respond, inputs=[msg, state_history, page_size], outputs=outputs, queue=False)
     msg.submit(respond, inputs=[msg, state_history, page_size], outputs=outputs, queue=False)
+
     # Like/Dislike
     def on_like(data: gr.LikeData):
         msg_like = data.value or {}
         role = msg_like.get("role", "assistant")
         text = msg_like.get("content", "")
-        app_log.info("FEEDBACK", extra={"__kv__": {"liked": data.liked, "role": role, "len": len(text or "")}})
+        app_log.info(
+            "Phản hồi người dùng",
+            extra={"__kv__": {"thich": data.liked, "vai_tro": role, "do_dai": len(text or "")}},
+        )
         return None
+
     chatbot.like(on_like)
 
-    # Pagination
+    # Phân trang
     def render_cites_for_page(docs, page, cur_page_size):
         md, label = docs_page_markdown(docs or [], int(page), int(cur_page_size))
         return gr.update(value=md), int(page), label
@@ -772,9 +956,24 @@ with gr.Blocks(
     def on_change_page_size(docs, cur_page_size):
         return render_cites_for_page(docs, 1, cur_page_size)
 
-    prev_page.click(go_prev, inputs=[state_docs, state_page, page_size], outputs=[cites_md, state_page, page_info], queue=False)
-    next_page.click(go_next, inputs=[state_docs, state_page, page_size], outputs=[cites_md, state_page, page_info], queue=False)
-    page_size.release(on_change_page_size, inputs=[state_docs, page_size], outputs=[cites_md, state_page, page_info], queue=False)
+    prev_page.click(
+        go_prev,
+        inputs=[state_docs, state_page, page_size],
+        outputs=[cites_md, state_page, page_info],
+        queue=False,
+    )
+    next_page.click(
+        go_next,
+        inputs=[state_docs, state_page, page_size],
+        outputs=[cites_md, state_page, page_info],
+        queue=False,
+    )
+    page_size.release(
+        on_change_page_size,
+        inputs=[state_docs, page_size],
+        outputs=[cites_md, state_page, page_info],
+        queue=False,
+    )
 
     gr.Markdown(f"""
     <sub>© {datetime.now().year} — Nội dung chỉ mang tính tham khảo, không thay thế tư vấn pháp lý chính thức.</sub>

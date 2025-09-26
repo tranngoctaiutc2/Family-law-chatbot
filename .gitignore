@@ -3,3 +3,4 @@ venvvenv/
 __pycache__/
 venv
 vertex-sa.json
+.gradio/
